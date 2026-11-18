@@ -14,6 +14,7 @@ pub mod modes;
 pub mod params;
 pub mod params_rt;
 pub mod parser;
+pub mod setup_queue;
 pub mod streamrates;
 pub mod tunnel;
 pub mod vehicle;

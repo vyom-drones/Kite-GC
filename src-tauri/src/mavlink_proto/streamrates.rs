@@ -168,11 +168,55 @@ fn send_plan(transport: &mut dyn ByteTransport, fc_sysid: u8, plan: &[(f32, f32)
         .count()
 }
 
-/// Apply the fleet profile to `fc_sysid` (see `FLEET_*`): airspeed and wind off.
-pub fn apply_fleet_stream_rates(transport: &mut dyn ByteTransport, fc_sysid: u8, is_px4: bool) {
+/// One MAV_CMD_SET_MESSAGE_INTERVAL (511) to the autopilot of `fc_sysid`.
+fn set_interval_cmd(fc_sysid: u8, msg_id: f32, interval_us: f32) -> MavMessage {
+    MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+        target_system: fc_sysid,
+        target_component: 1, // MAV_COMP_ID_AUTOPILOT1
+        command: MavCmd::MAV_CMD_SET_MESSAGE_INTERVAL,
+        confirmation: 0,
+        param1: msg_id,
+        param2: interval_us,
+        param3: 0.0,
+        param4: 0.0,
+        param5: 0.0,
+        param6: 0.0,
+        param7: 0.0,
+    })
+}
+
+fn plan_commands(fc_sysid: u8, plan: &[(f32, f32)]) -> Vec<MavMessage> {
+    plan.iter().map(|&(id, iv)| set_interval_cmd(fc_sysid, id, iv)).collect()
+}
+
+/// The SET_MESSAGE_INTERVAL commands of a profile, for the handler's paced, ACK-confirmed setup queue
+/// (`setup_queue`) — the same plans `apply_*` write directly before the handler starts.
+pub(crate) fn fleet_rate_commands(fc_sysid: u8, is_px4: bool) -> Vec<MavMessage> {
     let plan = planned_intervals(FLEET_ATTITUDE_HZ, FLEET_POSITION_HZ, FLEET_FIXED_HZ, false, false, is_px4);
-    let sent = send_plan(transport, fc_sysid, &plan);
-    log::debug!("MAVLink rates: fleet profile → sysid={} ({} SET_MESSAGE_INTERVAL)", fc_sysid, sent);
+    plan_commands(fc_sysid, &plan)
+}
+
+pub(crate) fn active_rate_commands(
+    fc_sysid: u8,
+    attitude_hz: f64,
+    position_hz: f64,
+    airspeed_enabled: bool,
+    wind_enabled: bool,
+    is_px4: bool,
+) -> Vec<MavMessage> {
+    let plan = planned_intervals(attitude_hz, position_hz, 1.0, airspeed_enabled, wind_enabled, is_px4);
+    plan_commands(fc_sysid, &plan)
+}
+
+/// Full-telemetry mode: every managed message back to its FC default (interval 0) — see `reset_stream_rates`.
+pub(crate) fn reset_rate_commands(fc_sysid: u8, is_px4: bool) -> Vec<MavMessage> {
+    WANTED
+        .iter()
+        .map(|&(id, _)| id)
+        .filter(|&id| !skip_foreign_wind(id, is_px4))
+        .chain(BALLAST_IDS.iter().copied())
+        .map(|id| set_interval_cmd(fc_sysid, id, 0.0))
+        .collect()
 }
 
 /// Apply the reduced GCS-requested stream rates (default mode): wanted messages at the two knobs,
@@ -232,19 +276,7 @@ fn send_set_interval(
     msg_id: f32,
     interval_us: f32,
 ) -> bool {
-    let cmd = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
-        target_system: fc_sysid,
-        target_component: 1, // MAV_COMP_ID_AUTOPILOT1
-        command: MavCmd::MAV_CMD_SET_MESSAGE_INTERVAL,
-        confirmation: 0,
-        param1: msg_id,
-        param2: interval_us,
-        param3: 0.0,
-        param4: 0.0,
-        param5: 0.0,
-        param6: 0.0,
-        param7: 0.0,
-    });
+    let cmd = set_interval_cmd(fc_sysid, msg_id, interval_us);
     let frame = codec::serialize_v2(header, &cmd, seq);
     match transport.write_bytes_to(codec::target_of(&cmd), &frame) {
         Ok(()) => true,

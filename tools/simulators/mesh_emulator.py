@@ -27,6 +27,18 @@ airtime budget in bytes/s with a bounded queue (a full queue drops, like a radio
 VIDEO_STREAM_INFORMATION with a `main` and a `preview` stream, on the drone's own link — like a companion
 whose camera manager speaks through the same router as the flight controller.
 
+RFD multipoint mode (--serial-pty PATH): an RFD900-class radio network instead of an IP mesh. Every drone's
+traffic reaches the GCS mixed on ONE serial port (a pseudo-terminal, linked at PATH — in a dev build of
+Kite list it with KITE_EXTRA_SERIAL_PORTS=PATH and connect as Serial); what Kite sends is broadcast to
+every drone and costs airtime once. The shared, half-duplex airtime is the --rate budget. Approximate
+presets (usable payload after the radio's overhead, not vendor-exact):
+
+  64 kbps air rate    --rate 6000  --queue 2048 --latency 30 --jitter 20 --loss 0.01
+  125 kbps            --rate 12000 --queue 4096 --latency 25 --jitter 15 --loss 0.01
+  250 kbps            --rate 24000 --queue 8192 --latency 20 --jitter 10 --loss 0.01
+
+  python tools/simulators/mesh_emulator.py --serial-pty /tmp/kite-rfd0 --rate 6000 --queue 2048 ...
+
 Point the drones at the listen port (SITL manager: UDP layout, port 14560) and Kite at UDP 14550.
 """
 
@@ -40,6 +52,7 @@ import socket
 import struct
 import sys
 import time
+import tty
 from collections import namedtuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -90,6 +103,32 @@ def split_frames(data):
         frames.append(Frame(sysid, compid, msgid, bytes(data[i + hdr:i + hdr + plen]), total))
         i += total
     return frames, junk
+
+
+def split_stream(buf):
+    """Cut the complete MAVLink frames off the front of a serial byte stream (frames straddle reads there).
+    Returns (raw frames, the unfinished rest to keep, skipped junk bytes)."""
+    out, junk, i, n = [], 0, 0, len(buf)
+    while i < n:
+        magic = buf[i]
+        if magic == 0xFD:
+            hdr = 10
+        elif magic == 0xFE:
+            hdr = 6
+        else:
+            junk += 1
+            i += 1
+            continue
+        if i + hdr > n:
+            break
+        total = hdr + buf[i + 1] + 2
+        if magic == 0xFD and buf[i + 2] & 0x01:
+            total += 13                          # signed frame: signature trailer
+        if i + total > n:
+            break
+        out.append(bytes(buf[i:i + total]))
+        i += total
+    return out, bytes(buf[i:]), junk
 
 
 class Decoder:
@@ -261,9 +300,29 @@ class Emulator:
         self.commands = []      # (t, key, sysid) at delivery to the addressed drone
         self.camera_seq = 0
         self.t0 = time.monotonic()
+        # Seconds each admitted datagram waits for airtime (+ latency) in the current report window.
+        self.delays = []
+        # RFD multipoint mode: the GCS side is one serial port (pty master), not a socket per drone.
+        self.serial_fd = None
+        self.serial_rx = b''
+        self.air_up_bytes = 0       # uplink airtime (broadcast: counted once, not per drone)
+        self.serial_overflow = 0    # parts dropped because nobody reads the serial port
+        if args.serial_pty:
+            self.serial_fd, slave = os.openpty()
+            tty.setraw(slave)
+            os.set_blocking(self.serial_fd, False)
+            self._slave = slave     # kept open: the port survives Kite disconnecting / reconnecting
+            if os.path.lexists(args.serial_pty):
+                os.remove(args.serial_pty)
+            os.symlink(os.ttyname(slave), args.serial_pty)
+            print(f'[mesh] RFD multipoint: GCS serial port {args.serial_pty} -> {os.ttyname(slave)}')
 
     def _drone(self, src):
         if src not in self.drones:
+            if self.serial_fd is not None:
+                self.drones[src] = (None, DroneStats(src))
+                print(f'[mesh] drone at {src[0]}:{src[1]} -> serial ({len(self.drones)} drone(s))')
+                return self.drones[src]
             up = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             up.bind(('0.0.0.0', 0))
             up.setblocking(False)
@@ -272,6 +331,12 @@ class Emulator:
             print(f'[mesh] drone at {src[0]}:{src[1]} -> Kite {self.gcs[0]}:{self.gcs[1]} '
                   f'from :{up.getsockname()[1]} ({len(self.drones)} drone(s))')
         return self.drones[src]
+
+    def _admit(self, nbytes, now):
+        at = self.mesh.admit(nbytes, now)
+        if at is not None:
+            self.delays.append(at - now)
+        return at
 
     def _schedule(self, at, sock, data, addr):
         heapq.heappush(self.pending, (at, self.seq, sock, data, addr))
@@ -282,18 +347,42 @@ class Emulator:
         frames, _junk = split_frames(data)
         if st.sysid is None:
             st.sysid = next((f.sysid for f in frames if f.sysid != GCS_SYSID), None)
-        at = self.mesh.admit(len(data), now)
+        at = self._admit(len(data), now)
         if at is None:
             st.down_dropped += 1
             return
         st.down_bytes += len(data)
         st.down_frames += len(frames)
-        self._schedule(at, up, data, self.gcs)
+        self._schedule(at, up, data, self.gcs)   # up is None in serial mode → the serial port
+
+    def on_serial(self, chunk, now):
+        """RFD multipoint uplink: Kite's serial bytes → frames, each broadcast to every drone (airtime once)."""
+        frames, self.serial_rx, _junk = split_stream(self.serial_rx + chunk)
+        for raw in frames:
+            at = self._admit(len(raw), now)
+            if at is None:
+                for _up, st in self.drones.values():
+                    st.up_dropped += 1
+                continue
+            self.air_up_bytes += len(raw)
+            (fr,), _ = split_frames(raw)
+            key, target = self.dec.command_key(fr), self.dec.target(fr)
+            for src, (_up, st) in self.drones.items():
+                st.up_frames += 1
+                if key and st.sysid is not None and target in (0, st.sysid):
+                    self.commands.append((at - self.t0, key, st.sysid))
+                if self.args.camera_uri and st.sysid is not None:
+                    for reply in camera_answer(self.dec, fr, st.sysid, self.args.camera_uri, self.camera_seq):
+                        self.camera_seq += 1
+                        back = self._admit(len(reply), at)
+                        if back is not None:
+                            self._schedule(back, None, reply, self.gcs)
+                self._schedule(at, self.down, raw, src)
 
     def on_uplink(self, data, up, now):
         src = self.by_sock[up]
         _sock, st = self.drones[src]
-        at = self.mesh.admit(len(data), now)
+        at = self._admit(len(data), now)
         if at is None:
             st.up_dropped += 1
             return
@@ -309,7 +398,7 @@ class Emulator:
                 # The drone's camera answers over the drone's own link (after the request crossed the mesh).
                 for reply in camera_answer(self.dec, fr, st.sysid, self.args.camera_uri, self.camera_seq):
                     self.camera_seq += 1
-                    back = self.mesh.admit(len(reply), at)
+                    back = self._admit(len(reply), at)
                     if back is not None:
                         self._schedule(back, up, reply, self.gcs)
         self._schedule(at, self.down, data, src)
@@ -318,7 +407,12 @@ class Emulator:
         while self.pending and self.pending[0][0] <= now:
             _at, _seq, sock, data, addr = heapq.heappop(self.pending)
             try:
-                sock.sendto(data, addr)
+                if sock is None:
+                    os.write(self.serial_fd, data)   # RFD mode: onto the GCS serial port
+                else:
+                    sock.sendto(data, addr)
+            except BlockingIOError:
+                self.serial_overflow += 1        # nobody reads the serial port — the part is lost
             except OSError:
                 pass                             # peer gone; the datagram is lost like on air
 
@@ -332,9 +426,20 @@ class Emulator:
                 timeout = 0.05
                 if self.pending:
                     timeout = max(0.0, min(timeout, self.pending[0][0] - now))
-                readable, _w, _x = select.select([self.down, *self.by_sock], [], [], timeout)
+                watch = [self.down, *self.by_sock] + ([self.serial_fd] if self.serial_fd is not None else [])
+                readable, _w, _x = select.select(watch, [], [], timeout)
                 now = time.monotonic()
                 for sock in readable:
+                    if sock == self.serial_fd:
+                        while True:
+                            try:
+                                chunk = os.read(self.serial_fd, 4096)
+                            except OSError:
+                                break
+                            if not chunk:
+                                break
+                            self.on_serial(chunk, now)
+                        continue
                     while True:
                         try:
                             data, addr = sock.recvfrom(65535)
@@ -350,10 +455,15 @@ class Emulator:
                     last_report = now
         except KeyboardInterrupt:
             pass
+        finally:
+            if self.args.serial_pty and os.path.islink(self.args.serial_pty):
+                os.remove(self.args.serial_pty)
         return self.summary()
 
     def report(self, dt, prev):
         rows, tot_down, tot_up = [], 0, 0
+        if self.serial_fd is not None:
+            tot_up = self.air_up_bytes - prev.get('_air_up', 0)
         cur = {}
         for _up, st in sorted(self.drones.values(), key=lambda v: v[1].sysid or 0):
             snap = st.snapshot()
@@ -361,7 +471,8 @@ class Emulator:
             p = prev.get(st.src, dict.fromkeys(DroneStats.FIELDS, 0))
             d = {k: snap[k] - p[k] for k in snap}
             tot_down += d['down_bytes']
-            tot_up += d['up_bytes']
+            if self.serial_fd is None:
+                tot_up += d['up_bytes']
             wasted = 100.0 * d['up_wasted'] / d['up_frames'] if d['up_frames'] else 0.0
             rows.append(f"  {st.sysid if st.sysid is not None else '?':>5}  {d['down_bytes'] / dt:>9.0f}  "
                         f"{d['up_bytes'] / dt:>9.0f}  {d['up_frames'] / dt:>8.1f}  {wasted:>6.1f}%  "
@@ -369,8 +480,14 @@ class Emulator:
         print(f"\n[mesh] t={time.monotonic() - self.t0:6.0f}s  drones={len(self.drones)}  "
               f"down={tot_down / dt:.0f} B/s  up={tot_up / dt:.0f} B/s  total={(tot_down + tot_up) / dt:.0f} B/s"
               + (f"  ({100.0 * (tot_down + tot_up) / dt / self.args.rate:.0f}% of budget)" if self.args.rate else ''))
+        if self.delays:
+            ds = sorted(self.delays)
+            print(f"  airtime wait: avg {1000 * sum(ds) / len(ds):.0f} ms, p95 {1000 * ds[int(0.95 * (len(ds) - 1))]:.0f} ms, "
+                  f"max {1000 * ds[-1]:.0f} ms" + (f"  serial overflow {self.serial_overflow}" if self.serial_fd is not None else ''))
+            self.delays = []
         print('  sysid   down B/s    up B/s   up fr/s  wasted  drops')
         print('\n'.join(rows))
+        cur['_air_up'] = self.air_up_bytes
         for b in command_bursts(self.commands)[-3:]:
             print(f"  group cmd {b['key']}: {b['drones']} drones, first->last {b['spread_s'] * 1000:.0f} ms")
         return cur
@@ -387,7 +504,9 @@ class Emulator:
             'elapsed_s': elapsed,
             'drones': sorted(drones, key=lambda d: d['sysid'] or 0),
             'total_down_bps': sum(d['down_bps'] for d in drones),
-            'total_up_bps': sum(d['up_bps'] for d in drones),
+            'total_up_bps': (self.air_up_bytes / elapsed) if self.serial_fd is not None
+                            else sum(d['up_bps'] for d in drones),
+            'serial_overflow': self.serial_overflow,
             'up_frames': sum(d['up_frames'] for d in drones),
             'up_wasted': sum(d['up_wasted'] for d in drones),
             'group_commands': command_bursts(self.commands),
@@ -409,6 +528,8 @@ def main():
     p.add_argument('--seconds', type=float, default=0.0, help='stop after this many seconds (0 = Ctrl+C)')
     p.add_argument('--json-out', help='write the final summary to this JSON file')
     p.add_argument('--defs', help='MAVLink dialect XML (default: the one in the mavlink crate)')
+    p.add_argument('--serial-pty', help='RFD multipoint mode: serve the GCS side as ONE serial port (a pty '
+                                        'linked at this path) instead of a UDP socket per drone')
     p.add_argument('--camera-uri', help="answer VIDEO_STREAM_INFORMATION requests as each drone's camera, "
                                         "URIs from this template ({sysid}, {stream} = main|preview)")
     a = p.parse_args()

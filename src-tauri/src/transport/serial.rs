@@ -237,6 +237,27 @@ fn is_phantom_serial_stub(port_name: &str) -> bool {
 /// offer a custom rename (the OS gives them no useful device descriptor). All other ports keep their
 /// USB/PCI descriptors.
 pub fn list_ports() -> Vec<PortInfo> {
+    #[allow(unused_mut)]
+    let mut ports = enumerated_ports();
+    // Dev builds only: pseudo-terminals never appear in the OS enumeration, so a simulator's virtual port
+    // (tools/simulators/mesh_emulator.py --serial-pty, an RFD multipoint stand-in) is offered from here.
+    #[cfg(debug_assertions)]
+    ports.extend(dev_extra_ports(std::env::var("KITE_EXTRA_SERIAL_PORTS").ok().as_deref()));
+    ports
+}
+
+/// `KITE_EXTRA_SERIAL_PORTS` (colon-separated paths) → extra entries for the port list. Dev builds only.
+#[cfg(debug_assertions)]
+fn dev_extra_ports(var: Option<&str>) -> Vec<PortInfo> {
+    var.unwrap_or("")
+        .split(':')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| PortInfo { path: p.to_string(), label: format!("{p} — virtual (dev)"), port_type: "virtual".to_string() })
+        .collect()
+}
+
+fn enumerated_ports() -> Vec<PortInfo> {
     #[cfg(target_os = "windows")]
     let (spp_outgoing, spp_all) = (bt_spp_outgoing_ports(), bt_spp_all_ports());
 
@@ -532,5 +553,21 @@ impl ByteTransport for SerialConnection {
 
     fn description(&self) -> String {
         format!("Serial({})", self.port_name)
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
+mod dev_port_tests {
+    use super::dev_extra_ports;
+
+    #[test]
+    fn extra_ports_from_the_environment_variable() {
+        let ports = dev_extra_ports(Some(" /tmp/kite-rfd0 :: /tmp/kite-rfd1:"));
+        let paths: Vec<&str> = ports.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(paths, ["/tmp/kite-rfd0", "/tmp/kite-rfd1"]);
+        assert_eq!(ports[0].label, "/tmp/kite-rfd0 — virtual (dev)");
+        assert_eq!(ports[0].port_type, "virtual");
+        assert!(dev_extra_ports(None).is_empty());
+        assert!(dev_extra_ports(Some("")).is_empty());
     }
 }

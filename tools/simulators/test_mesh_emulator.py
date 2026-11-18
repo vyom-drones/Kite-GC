@@ -2,16 +2,19 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Unit tests for mesh_emulator.py.  Run: python -m unittest tools/simulators/test_mesh_emulator.py"""
 
+import argparse
 import os
 import random
 import struct
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fc_sim import Dialect, crc16_mcrf4xx, find_dialect  # noqa: E402
 from mesh_emulator import (  # noqa: E402
-    CAMERA_COMPID, Decoder, DroneStats, Mesh, camera_answer, command_bursts, count_uplink, split_frames,
+    CAMERA_COMPID, Decoder, DroneStats, Emulator, Mesh, camera_answer, command_bursts, count_uplink,
+    split_frames, split_stream,
 )
 
 DEFS = find_dialect()
@@ -139,6 +142,49 @@ class CameraAnswerTest(unittest.TestCase):
         self.assertEqual(camera_answer(self.dec, self.request(command=176), 7, self.TEMPLATE), [])
         (hb,), _ = split_frames(frame_v2(self.d, 'HEARTBEAT', sysid=255, type=6, autopilot=8))
         self.assertEqual(camera_answer(self.dec, hb, 7, self.TEMPLATE), [])
+
+
+class SplitStreamTest(unittest.TestCase):
+    def test_a_frame_split_across_reads_waits_for_its_rest(self):
+        whole = frame_v1(0, b'\x01' * 9, sysid=3)
+        frames, rest, junk = split_stream(whole[:7])
+        self.assertEqual((frames, rest, junk), ([], whole[:7], 0))
+        frames, rest, junk = split_stream(rest + whole[7:] + whole[:2])
+        self.assertEqual(frames, [whole])
+        self.assertEqual(rest, whole[:2], 'the start of the next frame is kept')
+
+    def test_junk_is_skipped_and_signed_frames_are_whole(self):
+        signed = bytes([0xFD, 1, 0x01, 0, 0, 4, 1, 0, 0, 0]) + b'x' + b'cc' + b'S' * 13
+        frames, rest, junk = split_stream(b'\x00\x42' + signed)
+        self.assertEqual((frames, rest, junk), ([signed], b'', 2))
+
+
+@unittest.skipUnless(DEFS, 'MAVLink dialect XML not found (run cargo check in src-tauri once)')
+class SerialMultipointTest(unittest.TestCase):
+    def test_uplink_is_broadcast_to_every_drone_and_costs_airtime_once(self):
+        d = Dialect(DEFS)
+        path = os.path.join(tempfile.mkdtemp(), 'rfd0')
+        args = argparse.Namespace(gcs='127.0.0.1:1', listen=0, loss=0.0, latency=0.0, jitter=0.0, rate=0,
+                                  queue=65536, serial_pty=path, camera_uri=None)
+        emu = Emulator(args, Decoder(d))
+        try:
+            self.assertTrue(os.path.islink(path))
+            a, b = ('127.0.0.1', 40001), ('127.0.0.1', 40002)
+            emu.on_downlink(frame_v2(d, 'HEARTBEAT', sysid=1, type=2, autopilot=3), a, 0.0)
+            emu.on_downlink(frame_v2(d, 'HEARTBEAT', sysid=2, type=2, autopilot=3), b, 0.0)
+            emu.pending.clear()
+            rtl = frame_v2(d, 'COMMAND_LONG', sysid=255, target_system=0, command=20)
+            emu.on_serial(rtl[:5], 0.0)
+            self.assertEqual(emu.pending, [], 'half a frame is not sent yet')
+            emu.on_serial(rtl[5:], 0.0)
+            dests = sorted(addr for _at, _seq, _sock, data, addr in emu.pending if data == rtl)
+            self.assertEqual(dests, [a, b])
+            self.assertEqual(emu.air_up_bytes, len(rtl), 'one transmission reaches every node')
+            self.assertEqual(sorted(s for _t, _k, s in emu.commands), [1, 2])
+        finally:
+            os.close(emu.serial_fd)
+            os.close(emu._slave)
+            os.remove(path)
 
 
 class MeshTest(unittest.TestCase):

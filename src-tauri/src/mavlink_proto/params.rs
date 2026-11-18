@@ -31,17 +31,22 @@ pub fn request_param(transport: &mut dyn ByteTransport, fc_sysid: u8, name: &str
     let header = codec::gcs_header();
     let mut seq = MavSequence::new();
 
-    let msg = MavMessage::PARAM_REQUEST_READ(PARAM_REQUEST_READ_DATA {
-        param_index: -1,
-        target_system: fc_sysid,
-        target_component: 1, // MAV_COMP_ID_AUTOPILOT1
-        param_id: pack_param_id(name).into(),
-    });
+    let msg = param_request(fc_sysid, name);
     let frame = codec::serialize_v2(&header, &msg, &mut seq);
     match transport.write_bytes_to(codec::target_of(&msg), &frame) {
         Ok(()) => eprintln!("[MAVLINK-PARAM] requested {}", name),
         Err(e) => log::warn!("Failed to request {}: {}", name, e),
     }
+}
+
+/// PARAM_REQUEST_READ of `name` (by name) — for the handler's paced setup queue (`setup_queue`).
+pub(crate) fn param_request(fc_sysid: u8, name: &str) -> MavMessage {
+    MavMessage::PARAM_REQUEST_READ(PARAM_REQUEST_READ_DATA {
+        param_index: -1,
+        target_system: fc_sysid,
+        target_component: 1, // MAV_COMP_ID_AUTOPILOT1
+        param_id: pack_param_id(name).into(),
+    })
 }
 
 /// Request the active EKF core (AHRS_EKF_TYPE) once (2 = EKF2, 3 = EKF3).
@@ -59,18 +64,9 @@ pub fn request_quadplane_flag(transport: &mut dyn ByteTransport, fc_sysid: u8) {
 /// HOME_POSITION MAVLink message id (common #242).
 const MSG_ID_HOME_POSITION: f32 = 242.0;
 
-/// Request HOME_POSITION once (MAV_CMD_REQUEST_MESSAGE 512) — the MAVLink counterpart of the MSP
-/// path's one-shot MSP_WP(0) read, so a mid-flight connect / app restart recovers the real FC home
-/// immediately. This is what Mission Planner does (via the older GET_HOME_POSITION); it cannot be
-/// left to the 0.2 Hz SET_MESSAGE_INTERVAL push alone, because Full-telemetry mode resets that to
-/// the FC default and ArduPilot does not stream HOME_POSITION in any SRn group — home then only
-/// arrives on change. Fire-and-forget: the reply is decoded by the handler thread (emits
-/// `home-position`); the COMMAND_ACK is dispatched as a stray and dropped.
-pub fn request_home_position(transport: &mut dyn ByteTransport, fc_sysid: u8) {
-    let header = codec::gcs_header();
-    let mut seq = MavSequence::new();
-
-    let msg = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+/// MAV_CMD_REQUEST_MESSAGE(HOME_POSITION) — see `request_home_position`.
+pub(crate) fn home_position_request(fc_sysid: u8) -> MavMessage {
+    MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
         target_system: fc_sysid,
         target_component: 1, // MAV_COMP_ID_AUTOPILOT1
         command: MavCmd::MAV_CMD_REQUEST_MESSAGE,
@@ -82,7 +78,21 @@ pub fn request_home_position(transport: &mut dyn ByteTransport, fc_sysid: u8) {
         param5: 0.0,
         param6: 0.0,
         param7: 0.0,
-    });
+    })
+}
+
+/// Request HOME_POSITION once (MAV_CMD_REQUEST_MESSAGE 512) — the MAVLink counterpart of the MSP
+/// path's one-shot MSP_WP(0) read, so a mid-flight connect / app restart recovers the real FC home
+/// immediately. This is what Mission Planner does (via the older GET_HOME_POSITION); it cannot be
+/// left to the 0.2 Hz SET_MESSAGE_INTERVAL push alone, because Full-telemetry mode resets that to
+/// the FC default and ArduPilot does not stream HOME_POSITION in any SRn group — home then only
+/// arrives on change. Fire-and-forget: the reply is decoded by the handler thread (emits
+/// `home-position`); the COMMAND_ACK is dispatched as a stray and dropped.
+pub fn request_home_position(transport: &mut dyn ByteTransport, fc_sysid: u8) {
+    let header = codec::gcs_header();
+    let mut seq = MavSequence::new();
+
+    let msg = home_position_request(fc_sysid);
     let frame = codec::serialize_v2(&header, &msg, &mut seq);
     match transport.write_bytes_to(codec::target_of(&msg), &frame) {
         Ok(()) => eprintln!("[MAVLINK-PARAM] requested HOME_POSITION"),

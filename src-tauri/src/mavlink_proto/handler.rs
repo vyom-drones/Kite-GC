@@ -25,6 +25,7 @@ use crate::transport::ByteTransport;
 
 use super::codec::{self, MavSequence};
 use super::parser::{MavParser, Parsed};
+use super::setup_queue::{Kind as SetupKind, SetupQueue};
 
 /// GCS heartbeat interval (1 Hz as per MAVLink spec)
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
@@ -345,28 +346,35 @@ fn shutdown_secondaries(vehicles: &mut std::collections::BTreeMap<u8, VehicleCtx
 
 /// Stream profile of one vehicle: the configured profile (shaping, or the full-telemetry reset) for the
 /// app's active vehicle, the low-rate fleet profile for every other one (`streamrates::FLEET_*`).
-fn apply_rates(transport: &mut dyn ByteTransport, sysid: u8, fc_variant: &str, rates: &StreamRateConfig, active: bool) {
+fn rate_commands(sysid: u8, fc_variant: &str, rates: &StreamRateConfig, active: bool) -> Vec<MavMessage> {
     let is_px4 = fc_variant == "PX4";
     if !active {
-        super::streamrates::apply_fleet_stream_rates(transport, sysid, is_px4);
+        super::streamrates::fleet_rate_commands(sysid, is_px4)
     } else if rates.full_telemetry {
-        super::streamrates::reset_stream_rates(transport, sysid, is_px4);
+        super::streamrates::reset_rate_commands(sysid, is_px4)
     } else {
-        super::streamrates::apply_stream_rates(
-            transport, sysid, rates.attitude_hz, rates.position_hz, rates.airspeed_enabled, rates.wind_enabled, is_px4,
-        );
+        super::streamrates::active_rate_commands(
+            sysid, rates.attitude_hz, rates.position_hz, rates.airspeed_enabled, rates.wind_enabled, is_px4,
+        )
     }
 }
 
-/// Give a newly discovered vehicle the same treatment the connect path gave the handshake vehicle:
-/// its stream profile plus the one-shot EKF-type / home / Q_ENABLE requests.
-fn configure_new_vehicle(transport: &mut dyn ByteTransport, sysid: u8, fc_variant: &str, rates: &StreamRateConfig, active: bool) {
-    apply_rates(transport, sysid, fc_variant, rates, active);
-    super::params::request_ekf_type(transport, sysid);
-    super::params::request_home_position(transport, sysid);
+/// Give a newly discovered vehicle the same treatment the connect path gave the handshake vehicle — its
+/// stream profile plus the one-shot EKF-type / home / Q_ENABLE requests — through the paced, confirmed
+/// setup queue (a link carrying many vehicles must not get it all in one burst).
+fn configure_new_vehicle(setup: &mut SetupQueue, sysid: u8, fc_variant: &str, rates: &StreamRateConfig, active: bool) {
+    setup.replace_rates(sysid, rate_commands(sysid, fc_variant, rates, active));
+    setup.push(sysid, super::params::param_request(sysid, "AHRS_EKF_TYPE"), SetupKind::OneShot);
+    setup.push(sysid, super::params::home_position_request(sysid), SetupKind::OneShot);
     if fc_variant.starts_with("Ardu") {
-        super::params::request_quadplane_flag(transport, sysid);
+        setup.push(sysid, super::params::param_request(sysid, "Q_ENABLE"), SetupKind::OneShot);
     }
+}
+
+/// Uplink budget of the setup queue: a serial link is a telemetry radio (an RFD900 network shares a few
+/// kB/s among every vehicle), an IP link has room to spare.
+fn setup_budget_bps(transport_description: &str) -> f64 {
+    if transport_description.starts_with("Serial") { 1_000.0 } else { 8_000.0 }
 }
 
 /// Start the MAVLink handler on a dedicated thread
@@ -454,6 +462,8 @@ fn handler_loop(
     // The app's active vehicle, if it is on this link: it streams the full profile, every other vehicle
     // the fleet profile. The connect path gave the primary the full profile, so that is where it starts.
     let mut active_sysid: Option<u8> = Some(fc_sysid);
+    // Stream setup of vehicles discovered on this link, paced and ACK-confirmed (`setup_queue`).
+    let mut setup = SetupQueue::new(setup_budget_bps(&transport.description()));
     let mut param_fwd: Option<(u8, mpsc::Sender<MavMessage>)> = None;
     // MSP-over-MAVLink tunnel receiver (INAV 10.0+): payloads of TUNNEL frames addressed to Kite.
     let mut tunnel_fwd: Option<mpsc::Sender<Vec<u8>>> = None;
@@ -540,7 +550,7 @@ fn handler_loop(
                     let old = std::mem::replace(&mut active_sysid, new);
                     for (sysid, active) in [(old, false), (new, true)] {
                         let Some((&sysid, ctx)) = sysid.and_then(|s| vehicles.get_key_value(&s)) else { continue };
-                        apply_rates(&mut *transport, sysid, &ctx.fc_variant, &rates, active);
+                        setup.replace_rates(sysid, rate_commands(sysid, &ctx.fc_variant, &rates, active));
                     }
                     log::info!("MAVLink rates on L{}: full profile → {:?} (was {:?})", app_handle.link_id(), new, old);
                 }
@@ -725,6 +735,30 @@ fn handler_loop(
             }
         }
 
+        // 2c''. The setup queue's turn: what fits the budget now, and vehicles whose setup just finished.
+        let (setup_out, setup_done) = setup.poll(now);
+        for (sysid, msg) in setup_out {
+            let frame = codec::serialize_v2(&gcs_header, &msg, &mut seq);
+            debug_tracker.on_tx(msg.message_id(), frame.len());
+            link_stats.on_tx(frame.len());
+            if let Some(ref rec) = recorder {
+                if let Ok(mut r) = rec.lock() { r.write_raw_mavlink_frame(&frame); }
+            }
+            if let Err(e) = transport.write_bytes_to(Some(sysid), &frame) {
+                log::warn!("Failed to send stream setup to sysid={}: {}", sysid, e);
+            }
+        }
+        for (sysid, r) in setup_done {
+            if r.gave_up > 0 {
+                log::warn!(
+                    "MAVLink: sysid={} stream setup done — {} confirmed, {} refused, {} UNCONFIRMED after {} sends",
+                    sysid, r.confirmed, r.refused, r.gave_up, super::setup_queue::MAX_ATTEMPTS,
+                );
+            } else {
+                log::info!("MAVLink: sysid={} stream setup done — {} confirmed, {} refused", sysid, r.confirmed, r.refused);
+            }
+        }
+
         // 2c'. Ask every vehicle (the primary included) which video streams its camera serves.
         for (sysid, ctx) in vehicles.iter_mut() {
             if ctx.video_seen || ctx.video_requests >= MAX_VIDEO_STREAM_REQUESTS
@@ -839,7 +873,7 @@ fn handler_loop(
                         if ctx.fc_variant.starts_with("Ardu") {
                             ctx.modes = Some(super::modes::ModeEnumerator::new(sysid, Instant::now()));
                         }
-                        configure_new_vehicle(&mut *transport, sysid, &ctx.fc_variant, &rates, active_sysid == Some(sysid));
+                        configure_new_vehicle(&mut setup, sysid, &ctx.fc_variant, &rates, active_sysid == Some(sysid));
                         let _ = ctx.emitter.emit("vehicle-discovered", ctx.info(sysid, false));
                         vehicles.insert(sysid, ctx);
                     }
@@ -891,6 +925,13 @@ fn handler_loop(
                                 }
                                 continue;
                             }
+                        }
+                    }
+
+                    // The setup queue's own SET_MESSAGE_INTERVAL ACKs settle its in-flight command and stop here.
+                    if let MavMessage::COMMAND_ACK(ref ack) = frame.message {
+                        if setup.on_ack(sysid, ack.command, ack.result) {
+                            continue;
                         }
                     }
 
@@ -1030,6 +1071,7 @@ fn handler_loop(
                         if let Ok(mut r) = rec.lock() { r.shutdown_lost(); }
                         register_recorder(&c.emitter, None);
                     }
+                    setup.forget(s);
                     log::info!("MAVLink: vehicle sysid={} silent for {}s — dropped", s, VEHICLE_TIMEOUT.as_secs());
                     let _ = c.emitter.emit("vehicle-lost", serde_json::json!({
                         "vehicleId": c.emitter.key(),
