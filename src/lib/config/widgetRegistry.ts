@@ -37,6 +37,7 @@ const ALL_WIDGET_DEFS: WidgetDef[] = [
   { id: 'terrainRadar', label: 'Terrain Radar',  labelKey: 'widgets.terrainRadar', shape: 'square', defaultSize: 'L' },
   { id: 'weather',      label: 'Weather',        labelKey: 'widgets.weather',      shape: 'wide',   defaultSize: 'L' },
   { id: 'videoFeed',    label: 'Video',          labelKey: 'widgets.video',        shape: 'wide',   defaultSize: 'W' },
+  { id: 'quickActions', label: 'Quick actions',  labelKey: 'widgets.quickActions', shape: 'wide',   defaultSize: 'W' },
 ];
 
 // Every platform, the phone included since PHONE_VIDEO.md D5 (the video widget is off by default

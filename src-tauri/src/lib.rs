@@ -103,6 +103,8 @@ use commands::video::{
     video_native_mjpeg_start, video_native_mjpeg_stop, video_rtsp_mjpeg_start,
     video_rtsp_native_start, video_rtsp_native_stop,
     video_rtsp_native_sink_surfaces, video_rtsp_native_stats,
+    video_preview_start, video_preview_stop, video_preview_stop_all, video_preview_stats,
+    fleet_video_window_open, fleet_video_window_close,
     video_linux_hole_spike,
     video_rtsp_native_sink_buffer, video_rtsp_native_sink_orient,
     video_detached_open, video_detached_close, video_detached_pin_top, video_detached_chrome, video_detached_aspect, video_detached_nudge,
@@ -566,6 +568,7 @@ pub fn run() {
         .manage(std::sync::Arc::new(MediaMtx::new()))
         .manage(MjpegServer::new())
         .manage(video::rtsp_native::NativeRtsp::new())
+        .manage(video::preview::PreviewSessions::new())
         .invoke_handler(tauri::generate_handler![
             location::location_os_last,
             location::location_os_start,
@@ -773,6 +776,12 @@ pub fn run() {
             video_rtsp_native_sink_surfaces,
             video_linux_hole_spike,
             video_rtsp_native_stats,
+            video_preview_start,
+            video_preview_stop,
+            video_preview_stop_all,
+            video_preview_stats,
+            fleet_video_window_open,
+            fleet_video_window_close,
             video_rtsp_native_sink_buffer,
             video_rtsp_native_sink_orient,
             video_native_mjpeg_stop,

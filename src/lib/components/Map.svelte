@@ -82,6 +82,8 @@
   import { loadUavMesh, type UavMesh } from "$lib/helpers/uavMesh";
   import { renderUavTopDown, FIT as MODEL_FIT } from "$lib/helpers/uavTopDown";
   import { FleetModelSprites } from "$lib/helpers/fleetModelSprites";
+  import MapVideoPopup from "$lib/components/video/MapVideoPopup.svelte";
+  import { vehicleStreams } from "$lib/stores/fleetVideo";
   import { toTelemetryData } from "$lib/adapters/telemetryAdapter";
   import { sunAltitudeDeg, cesiumLikeBrightness } from "$lib/utils/sun";
   import { ensureUserLocation, resolveUserLocation, userGeoLocation } from "$lib/helpers/userLocation";
@@ -549,6 +551,34 @@
     c.width = size; c.height = size;
     return c;
   });
+  // Fleet video on hover (MapVideoPopup): a drone's live preview above its marker while the pointer is on it.
+  // One at a time; its lease starts the preview stream and closing ends it (after the idle delay).
+  let fleetVideoPopup: { id: string; popup: L.Popup; comp: ReturnType<typeof mount> } | null = null;
+  const fleetColors = new Map<string, string>();
+  function openFleetVideo(id: string, marker: L.Marker) {
+    const source = get(vehicleStreams).get(id)?.preview;
+    const v = fleetKnown.get(id);
+    if (!source || !v || !map) return;
+    closeFleetVideo();
+    marker.closeTooltip();
+    const el = document.createElement('div');
+    const comp = mount(MapVideoPopup, {
+      target: el,
+      props: { vehicleId: id, name: v.name, color: fleetColors.get(id) ?? '#37a8db', source },
+    });
+    const popup = L.popup({
+      closeButton: false, autoPan: false, autoClose: false, closeOnClick: false,
+      className: 'fleet-video-popup', offset: [0, -14],
+    }).setLatLng(marker.getLatLng()).setContent(el);
+    map.addLayer(popup);
+    fleetVideoPopup = { id, popup, comp };
+  }
+  function closeFleetVideo(id?: string) {
+    if (!fleetVideoPopup || (id && fleetVideoPopup.id !== id)) return;
+    map?.removeLayer(fleetVideoPopup.popup);
+    void unmount(fleetVideoPopup.comp);
+    fleetVideoPopup = null;
+  }
   function drawFleetModel(id: string, marker: L.Marker, platformType: number, heading: number, pitch: number, roll: number, color: string) {
     const cv = marker.getElement()?.querySelector('canvas') as HTMLCanvasElement | null;
     const ctx = cv?.getContext('2d');
@@ -734,6 +764,7 @@
     ordered.forEach((v, idx) => {
       const tv = fleetTelem.get(v.vehicleId);
       const color = vehicleColor(idx);
+      fleetColors.set(v.vehicleId, color);
       const isActiveVehicle = v.vehicleId === fleetActive;
       if (!tv || !tv.lastUpdate || !isValidGpsCoordinate(tv.lat, tv.lon)) {
         // No position yet (or link gone): its parked PLAN is still worth seeing on the map.
@@ -756,6 +787,7 @@
         if (marker) {
           marker.setLatLng([tv.lat, tv.lon]);
           marker.setTooltipContent(tip);
+          if (fleetVideoPopup?.id === v.vehicleId) fleetVideoPopup.popup.setLatLng([tv.lat, tv.lon]);
         } else {
           const id = v.vehicleId;
           marker = L.marker([tv.lat, tv.lon], { zIndexOffset: 900 });
@@ -764,8 +796,11 @@
           marker.on('click', (e: L.LeafletMouseEvent) => {
             const oe = e.originalEvent;
             if (oe && (oe.ctrlKey || oe.metaKey)) { toggleSelected(id); return; }
+            closeFleetVideo(id);
             void switchVehicle(id);
           });
+          marker.on('mouseover', () => openFleetVideo(id, marker!));
+          marker.on('mouseout', () => closeFleetVideo(id));
           marker.addTo(fleetLayer!);
           fleetMarkers.set(id, marker);
         }
@@ -783,6 +818,7 @@
         updateFleetMission(v, color, fleetLayer!);
       } else {
         retireFleetTrail(v.vehicleId);
+        closeFleetVideo(v.vehicleId);
         removeFleetHome(v.vehicleId, fleetLayer!);
         removeFleetMission(v.vehicleId, fleetLayer!);
       }
@@ -825,7 +861,7 @@
       }
     });
     for (const [id, m] of fleetMarkers) {
-      if (!seen.has(id)) { fleetLayer.removeLayer(m); fleetMarkers.delete(id); fleetIconKeys.delete(id); fleetSprites.forget(id); }
+      if (!seen.has(id)) { fleetLayer.removeLayer(m); fleetMarkers.delete(id); fleetIconKeys.delete(id); fleetSprites.forget(id); closeFleetVideo(id); }
     }
     if (viewMode === 'fleet') fitFleet(false); // keep every (selected) vehicle in view
     pruneFleetState(fleetLayer);
@@ -2910,6 +2946,7 @@
   });
 
   onDestroy(() => {
+    closeFleetVideo();
     if (followRaf != null) cancelAnimationFrame(followRaf);
     if (nightTimer) clearInterval(nightTimer);
     unsubUserGeo?.();
@@ -3346,6 +3383,12 @@
     box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
   }
   :global(.guided-popup-wrap .leaflet-popup-tip) { background: rgba(46, 46, 46, 0.97); }
+
+  /* Fleet video hover popup: just the tile (MapVideoPopup) — no Leaflet frame, never in the pointer's way. */
+  :global(.fleet-video-popup) { pointer-events: none; }
+  :global(.fleet-video-popup .leaflet-popup-content-wrapper) { background: transparent; box-shadow: none; padding: 0; border-radius: 0; }
+  :global(.fleet-video-popup .leaflet-popup-content) { margin: 0; line-height: normal; }
+  :global(.fleet-video-popup .leaflet-popup-tip-container) { display: none; }
 
   /* Fleet (other connected vehicles) markers — heading arrow + name; armed vehicles get a halo. */
   :global(.fleet-divicon),

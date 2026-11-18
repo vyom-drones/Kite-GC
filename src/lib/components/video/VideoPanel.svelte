@@ -58,6 +58,8 @@
   import NumberStepper from '$lib/components/NumberStepper.svelte';
   import Toggle from '$lib/components/panel/Toggle.svelte';
   import { isLinux, isMobile, isAndroid, isPhone, hasVideo } from '$lib/platform';
+  import { fleetEnabled } from '$lib/stores/fleetMode';
+  import FleetVideoSettings from './FleetVideoSettings.svelte';
 
   // Which saved RTSP connection is being edited inline (null = none).
   let editingRtspId = $state<string | null>(null);
@@ -553,6 +555,10 @@
             </div>
           {/each}
         </div>
+      {/if}
+
+      {#if $fleetEnabled}
+        <FleetVideoSettings />
       {/if}
 
       <!-- Receive-buffer depth in frame times (applied live, persisted) — to the WebRTC receiver, the MJPEG

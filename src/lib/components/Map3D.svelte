@@ -49,6 +49,9 @@
   import { matchActiveMode } from "$lib/helpers/mavModes";
   import { detectVehicleClass, arduMissionsByVehicle } from "$lib/stores/missionArdupilot";
   import { vehicleColor } from "$lib/helpers/vehicleColors";
+  import { orderedVehicles, vehicleColorFor } from "$lib/helpers/fleetStatus";
+  import MapVideoPopup from "$lib/components/video/MapVideoPopup.svelte";
+  import { vehicleStreams } from "$lib/stores/fleetVideo";
   import { connection, type ConnectionStatus } from "$lib/stores/connection";
   import { settings } from "$lib/stores/settings";
   import { gcsLocation } from "$lib/stores/gcsLocation";
@@ -1472,7 +1475,7 @@
     radar3dPickHandler.setInputAction((e: Cesium.ScreenSpaceEventHandler.PositionedEvent) => {
       // Fleet (other connected vehicles) first: a click makes that vehicle the active one.
       const vid = fleet3dPickId(e.position);
-      if (vid != null) { void switchVehicle(vid); return; }
+      if (vid != null) { fleetVideoHover = null; void switchVehicle(vid); return; }
       const id = radarPickId(e.position);
       if (id != null) { radarSelection.update((cur) => (cur === id ? null : id)); return; }
       // The own aircraft: the terrain behind it along the ray is not what the tap meant. Looked for
@@ -1487,7 +1490,9 @@
       if (vid != null) toggleSelected(vid);
     }, Cesium.ScreenSpaceEventType.LEFT_CLICK, Cesium.KeyboardEventModifier.CTRL);
     radar3dPickHandler.setInputAction((e: Cesium.ScreenSpaceEventHandler.MotionEvent) => {
-      if (viewer) viewer.canvas.style.cursor = (fleet3dPickId(e.endPosition) != null || radarPickId(e.endPosition) != null) ? 'pointer' : '';
+      const vid = fleet3dPickId(e.endPosition);
+      if (viewer) viewer.canvas.style.cursor = (vid != null || radarPickId(e.endPosition) != null) ? 'pointer' : '';
+      updateFleetVideoHover(vid, e.endPosition);
     }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
     updateFleet3D();
 
@@ -1792,6 +1797,25 @@
   const FLEET3D_TARGET_STALE_MS = 10_000;
   const FLEET3D_TRAIL_MIN_M = 5;
   const FLEET3D_MODEL_TINT = 0.55;
+
+  // Fleet video on hover (MapVideoPopup): the drone under the pointer shows its live preview next to the
+  // cursor; the popup (and its stream lease) stays while the pointer stays on the same drone.
+  let fleetVideoHover = $state<{ id: string; name: string; color: string; source: string; x: number; y: number } | null>(null);
+  function updateFleetVideoHover(vid: string | null, pos: Cesium.Cartesian2) {
+    const v = vid != null ? fleet3dKnown.get(vid) : undefined;
+    const source = vid != null ? get(vehicleStreams).get(vid)?.preview : null;
+    if (!vid || !v || !source || vid === fleet3dActive) {
+      fleetVideoHover = null;
+      return;
+    }
+    if (fleetVideoHover?.id === vid) {
+      fleetVideoHover.x = pos.x;
+      fleetVideoHover.y = pos.y;
+      return;
+    }
+    const color = vehicleColorFor(orderedVehicles(fleet3dKnown), vid);
+    fleetVideoHover = { id: vid, name: v.name, color, source, x: pos.x, y: pos.y };
+  }
 
   function fleet3dPickId(windowPos: Cesium.Cartesian2): string | null {
     if (!viewer) return null;
@@ -5396,6 +5420,14 @@
 <div class="map3d-wrapper" style="--map-inset-right: {centerInsetRight}px">
   <div class="cesium-container" bind:this={cesiumContainer}></div>
 
+  {#if fleetVideoHover}
+    <div class="fleet-video-hover" style:left="{fleetVideoHover.x + 16}px" style:top="{fleetVideoHover.y + 16}px">
+      {#key fleetVideoHover.id}
+        <MapVideoPopup vehicleId={fleetVideoHover.id} name={fleetVideoHover.name} color={fleetVideoHover.color} source={fleetVideoHover.source} />
+      {/key}
+    </div>
+  {/if}
+
   {#if cameraMode === 'fpv'}
     {@const sp = convertSpeed(hud.speedMs, hudSpeedUnit)}
     {@const al = convertAltitude(hud.altM, hudAltUnit)}
@@ -5501,6 +5533,7 @@
 </div>
 
 <style>
+  .fleet-video-hover { position: absolute; z-index: 5; pointer-events: none; }
   .map3d-wrapper {
     width: 100%;
     height: 100%;

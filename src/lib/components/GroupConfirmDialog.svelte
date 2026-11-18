@@ -154,6 +154,7 @@
               <span>{$t('fleet.group.stagger')}</span>
               <NumberStepper bind:value={staggerS} min={0} max={10} step={0.5} decimals={1} unit="s" />
             </label>
+            <p class="gc-note">{$t('fleet.group.takeoffArms')}</p>
           {:else if kind === 'changeSpeed'}
             <label class="gc-param">
               <span>{$t('fleet.group.speed')}</span>

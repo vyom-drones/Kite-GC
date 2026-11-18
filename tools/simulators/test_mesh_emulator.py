@@ -11,7 +11,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from fc_sim import Dialect, crc16_mcrf4xx, find_dialect  # noqa: E402
 from mesh_emulator import (  # noqa: E402
-    Decoder, DroneStats, Mesh, command_bursts, count_uplink, split_frames,
+    CAMERA_COMPID, Decoder, DroneStats, Mesh, camera_answer, command_bursts, count_uplink, split_frames,
 )
 
 DEFS = find_dialect()
@@ -102,6 +102,43 @@ class DecoderTest(unittest.TestCase):
                + frame_v2(self.d, 'PARAM_REQUEST_LIST', sysid=255, target_system=0))
         count_uplink(st, split_frames(raw)[0], self.dec)
         self.assertEqual((st.up_frames, st.up_wasted), (4, 1))
+
+
+@unittest.skipUnless(DEFS, 'MAVLink dialect XML not found (run cargo check in src-tauri once)')
+class CameraAnswerTest(unittest.TestCase):
+    TEMPLATE = 'rtsp://127.0.0.1:8554/drone{sysid}/{stream}'
+
+    @classmethod
+    def setUpClass(cls):
+        cls.d = Dialect(DEFS)
+        cls.dec = Decoder(cls.d)
+
+    def request(self, target_system=7, target_component=0, param1=269.0, command=512):
+        (fr,), _ = split_frames(frame_v2(self.d, 'COMMAND_LONG', sysid=255, target_system=target_system,
+                                         target_component=target_component, command=command, param1=param1))
+        return fr
+
+    def test_answers_a_stream_request_with_main_and_preview(self):
+        replies = camera_answer(self.dec, self.request(), 7, self.TEMPLATE)
+        frames = [f for r in replies for f in split_frames(r)[0]]
+        self.assertEqual(len(frames), 2)
+        infos = [self.d.unpack('VIDEO_STREAM_INFORMATION', f.payload) for f in frames]
+        uris = [bytes(i['uri']).rstrip(b'\0').decode() for i in infos]
+        self.assertEqual(uris, ['rtsp://127.0.0.1:8554/drone7/main', 'rtsp://127.0.0.1:8554/drone7/preview'])
+        self.assertTrue(all(f.sysid == 7 and f.compid == CAMERA_COMPID for f in frames))
+        self.assertEqual([i['count'] for i in infos], [2, 2])
+        self.assertEqual([i['resolution_v'] for i in infos], [720, 176])
+
+    def test_answers_requests_to_the_camera_component_too(self):
+        self.assertEqual(len(camera_answer(self.dec, self.request(target_component=CAMERA_COMPID), 7, self.TEMPLATE)), 2)
+
+    def test_ignores_other_requests_and_other_systems(self):
+        self.assertEqual(camera_answer(self.dec, self.request(param1=148.0), 7, self.TEMPLATE), [])
+        self.assertEqual(camera_answer(self.dec, self.request(target_system=9), 7, self.TEMPLATE), [])
+        self.assertEqual(camera_answer(self.dec, self.request(target_component=1), 7, self.TEMPLATE), [])
+        self.assertEqual(camera_answer(self.dec, self.request(command=176), 7, self.TEMPLATE), [])
+        (hb,), _ = split_frames(frame_v2(self.d, 'HEARTBEAT', sysid=255, type=6, autopilot=8))
+        self.assertEqual(camera_answer(self.dec, hb, 7, self.TEMPLATE), [])
 
 
 class MeshTest(unittest.TestCase):

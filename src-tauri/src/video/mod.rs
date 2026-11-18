@@ -15,6 +15,8 @@ pub mod native;
 #[cfg(target_os = "linux")]
 pub mod v4l2;
 pub mod mjpeg_server;
+/// Fleet video: many small live MJPEG tiles at once (grid, map popups).
+pub mod preview;
 pub mod rtsp;
 pub mod rtsp_native;
 /// What the frontend's surface routers publish — the holes every decode sink presents into.

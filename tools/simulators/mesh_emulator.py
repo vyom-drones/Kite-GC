@@ -21,6 +21,11 @@ airtime budget in bytes/s with a bounded queue (a full queue drops, like a radio
   python tools/simulators/mesh_emulator.py --listen 14560 --gcs 127.0.0.1:14550
   python tools/simulators/mesh_emulator.py --loss 0.05 --latency 80 --jitter 40 --rate 40000
   python tools/simulators/mesh_emulator.py --seconds 120 --json-out /tmp/mesh.json
+  python tools/simulators/mesh_emulator.py --camera-uri 'rtsp://127.0.0.1:8554/drone{sysid}/{stream}'
+
+--camera-uri also plays each drone's camera manager (component 100): it answers the GCS's request for
+VIDEO_STREAM_INFORMATION with a `main` and a `preview` stream, on the drone's own link — like a companion
+whose camera manager speaks through the same router as the flight controller.
 
 Point the drones at the listen port (SITL manager: UDP layout, port 14560) and Kite at UDP 14550.
 """
@@ -32,12 +37,13 @@ import os
 import random
 import select
 import socket
+import struct
 import sys
 import time
 from collections import namedtuple
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from fc_sim import Dialect, find_dialect  # noqa: E402  (shared MAVLink dialect loader)
+from fc_sim import Dialect, crc16_mcrf4xx, find_dialect  # noqa: E402  (shared MAVLink dialect loader)
 
 GCS_SYSID = 255
 COMMAND_MSGS = ('COMMAND_LONG', 'COMMAND_INT', 'SET_MODE')
@@ -121,6 +127,42 @@ class Decoder:
         if f['command'] == 176:                  # MAV_CMD_DO_SET_MODE: the mode is the command
             return f'{name} DO_SET_MODE {int(f["param2"])}'
         return f'{name} {f["command"]}'
+
+
+def build_frame(dialect, name, sysid, compid, seq, values):
+    """One MAVLink v2 frame of message `name` (no v2 truncation, which is optional for a sender)."""
+    msgid, payload = dialect.pack(name, values)
+    header = struct.pack('<BBBBBB', len(payload), 0, 0, seq & 0xFF, sysid, compid) + struct.pack('<I', msgid)[:3]
+    crc = crc16_mcrf4xx(header + payload)
+    crc = crc16_mcrf4xx(bytes([dialect.messages[name][3]]), crc)
+    return b'\xfd' + header + payload + struct.pack('<H', crc)
+
+
+CAMERA_COMPID = 100
+MSG_VIDEO_STREAM_INFORMATION = 269
+CMD_REQUEST_MESSAGE = 512
+# (stream_id, name, width, height, fps, bitrate, encoding: 1 = H.264, 0 = unknown/MJPEG)
+CAMERA_STREAMS = [(1, 'main', 1280, 720, 30.0, 2_000_000, 1), (2, 'preview', 320, 176, 5.0, 300_000, 0)]
+
+
+def camera_answer(decoder, frame, sysid, uri_template, seq=0):
+    """Frames a drone's camera answers to one uplink frame: VIDEO_STREAM_INFORMATION per stream for a
+    REQUEST_MESSAGE(269) addressed to this system (any component), else nothing."""
+    if decoder.name(frame.msgid) != 'COMMAND_LONG':
+        return []
+    f = decoder.d.unpack('COMMAND_LONG', frame.payload)
+    if f['command'] != CMD_REQUEST_MESSAGE or int(f['param1']) != MSG_VIDEO_STREAM_INFORMATION:
+        return []
+    if f['target_system'] not in (0, sysid) or f['target_component'] not in (0, CAMERA_COMPID):
+        return []
+    out = []
+    for i, (sid, name, w, h, fps, bps, enc) in enumerate(CAMERA_STREAMS):
+        uri = uri_template.replace('{sysid}', str(sysid)).replace('{stream}', name)
+        out.append(build_frame(decoder.d, 'VIDEO_STREAM_INFORMATION', sysid, CAMERA_COMPID, seq + i, {
+            'stream_id': sid, 'count': len(CAMERA_STREAMS), 'type': 0, 'flags': 1, 'framerate': fps,
+            'resolution_h': w, 'resolution_v': h, 'bitrate': bps, 'name': name, 'uri': uri, 'encoding': enc,
+        }))
+    return out
 
 
 # ── Shared medium ────────────────────────────────────────────────────────────
@@ -217,6 +259,7 @@ class Emulator:
         self.pending = []       # heap of (deliver_at, seq, socket, data, addr)
         self.seq = 0
         self.commands = []      # (t, key, sysid) at delivery to the addressed drone
+        self.camera_seq = 0
         self.t0 = time.monotonic()
 
     def _drone(self, src):
@@ -262,6 +305,13 @@ class Emulator:
             target = self.dec.target(fr)
             if key and st.sysid is not None and target in (0, st.sysid):
                 self.commands.append((at - self.t0, key, st.sysid))
+            if self.args.camera_uri and st.sysid is not None:
+                # The drone's camera answers over the drone's own link (after the request crossed the mesh).
+                for reply in camera_answer(self.dec, fr, st.sysid, self.args.camera_uri, self.camera_seq):
+                    self.camera_seq += 1
+                    back = self.mesh.admit(len(reply), at)
+                    if back is not None:
+                        self._schedule(back, up, reply, self.gcs)
         self._schedule(at, self.down, data, src)
 
     def flush(self, now):
@@ -359,6 +409,8 @@ def main():
     p.add_argument('--seconds', type=float, default=0.0, help='stop after this many seconds (0 = Ctrl+C)')
     p.add_argument('--json-out', help='write the final summary to this JSON file')
     p.add_argument('--defs', help='MAVLink dialect XML (default: the one in the mavlink crate)')
+    p.add_argument('--camera-uri', help="answer VIDEO_STREAM_INFORMATION requests as each drone's camera, "
+                                        "URIs from this template ({sysid}, {stream} = main|preview)")
     a = p.parse_args()
     defs = a.defs or find_dialect()
     if not defs:

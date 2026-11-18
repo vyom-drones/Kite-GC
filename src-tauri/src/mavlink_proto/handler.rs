@@ -39,6 +39,10 @@ const VEHICLE_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 /// loop (never blocking it). An autopilot that does not answer keeps no hardware id.
 const IDENTITY_REQUEST_INTERVAL: Duration = Duration::from_millis(1500);
 const MAX_IDENTITY_REQUESTS: u8 = 4;
+/// Every vehicle is asked for its camera's VIDEO_STREAM_INFORMATION (fleet video, `video_streams`) this
+/// often, this many times, until something answers — a companion's camera manager may come up after the FC.
+const VIDEO_STREAM_REQUEST_INTERVAL: Duration = Duration::from_secs(10);
+const MAX_VIDEO_STREAM_REQUESTS: u8 = 3;
 
 /// Read timeout while RC override is streaming. The loop is read-driven, so the idle read timeout (50 ms)
 /// would otherwise quantize the RC send rate (a 25 Hz request landing on a 50 ms grid only managed ~15
@@ -217,6 +221,11 @@ struct VehicleCtx {
     /// Reader of this vehicle's own mode list (AVAILABLE_MODES) — ArduPilot vehicles only; `None` for
     /// PX4 / INAV / anything else, and for the primary until the connect path sends `StartModeList`.
     modes: Option<super::modes::ModeEnumerator>,
+    /// Video stream discovery (`video_streams`): requests sent, the last one's time, and whether any
+    /// component of this system answered.
+    video_requests: u8,
+    last_video_request: Option<Instant>,
+    video_seen: bool,
 }
 
 impl VehicleCtx {
@@ -239,6 +248,9 @@ impl VehicleCtx {
             last_identity_request: None,
             identity_done: false,
             modes: None,
+            video_requests: 0,
+            last_video_request: None,
+            video_seen: false,
         }
     }
 
@@ -713,6 +725,27 @@ fn handler_loop(
             }
         }
 
+        // 2c'. Ask every vehicle (the primary included) which video streams its camera serves.
+        for (sysid, ctx) in vehicles.iter_mut() {
+            if ctx.video_seen || ctx.video_requests >= MAX_VIDEO_STREAM_REQUESTS
+                || ctx.last_video_request.is_some_and(|t| now.duration_since(t) < VIDEO_STREAM_REQUEST_INTERVAL)
+            {
+                continue;
+            }
+            ctx.video_requests += 1;
+            ctx.last_video_request = Some(now);
+            let msg = super::video_streams::video_stream_request(*sysid);
+            let frame = codec::serialize_v2(&gcs_header, &msg, &mut seq);
+            debug_tracker.on_tx(msg.message_id(), frame.len());
+            link_stats.on_tx(frame.len());
+            if let Some(ref rec) = recorder {
+                if let Ok(mut r) = rec.lock() { r.write_raw_mavlink_frame(&frame); }
+            }
+            if let Err(e) = transport.write_bytes_to(Some(*sysid), &frame) {
+                log::warn!("Failed to request VIDEO_STREAM_INFORMATION from sysid={}: {}", sysid, e);
+            }
+        }
+
         // 2d. Read each ArduPilot vehicle's own mode list (AVAILABLE_MODES), one index per request and
         //     at most one in flight per vehicle — see modes.rs. Paused while a mission transfer runs on
         //     this link (its request/response exchange must not compete with extra traffic).
@@ -929,6 +962,17 @@ fn handler_loop(
                                 let _ = ctx.emitter.emit("vehicle-discovered", ctx.info(sysid, false));
                             }
                         }
+                    }
+
+                    // A camera on this system advertising a stream (any component — usually not the autopilot).
+                    if let MavMessage::VIDEO_STREAM_INFORMATION(ref vs) = frame.message {
+                        let stream = super::video_streams::parse_video_stream(frame.header.component_id, vs);
+                        if !ctx.video_seen {
+                            log::info!("MAVLink: sysid={} camera (compid {}) advertises video: {} {}",
+                                sysid, stream.compid, stream.kind, stream.uri);
+                        }
+                        ctx.video_seen = true;
+                        let _ = ctx.emitter.emit("telemetry-video-stream", &stream);
                     }
 
                     dispatch_message(

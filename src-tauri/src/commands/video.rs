@@ -312,6 +312,108 @@ pub fn video_rtsp_native_stats(
         .unwrap_or_else(|| serde_json::json!({ "active": false }))
 }
 
+/// Emitted when a running preview session's source dies (`{ streamId }`) — never on our own stop.
+pub const PREVIEW_ENDED_EVENT: &str = "video-preview-ended";
+
+/// Start (or reuse) the fleet-video preview session `stream_id` on `url` (`video::preview`). Resolves with
+/// the session's local multipart MJPEG URL once the first picture arrived.
+#[tauri::command(async)]
+pub fn video_preview_start(
+    app: AppHandle,
+    window: tauri::Window,
+    stream_id: String,
+    url: String,
+    transport: Option<String>,
+    previews: State<'_, crate::video::preview::PreviewSessions>,
+) -> Result<String, String> {
+    let id = stream_id.clone();
+    let on_ended: EndedHook = Arc::new(move || {
+        let _ = app.emit(PREVIEW_ENDED_EVENT, serde_json::json!({ "streamId": id }));
+    });
+    // The calling window owns its share of the session (see `video::preview`).
+    let port = previews.start(&stream_id, window.label(), &url, transport.as_deref().unwrap_or("auto"), on_ended)?;
+    Ok(format!("http://127.0.0.1:{port}/"))
+}
+
+#[tauri::command(async)]
+pub fn video_preview_stop(
+    window: tauri::Window,
+    stream_id: String,
+    previews: State<'_, crate::video::preview::PreviewSessions>,
+) {
+    previews.stop(&stream_id, window.label());
+}
+
+#[tauri::command(async)]
+pub fn video_preview_stop_all(previews: State<'_, crate::video::preview::PreviewSessions>) {
+    previews.stop_all();
+}
+
+/// The separate fleet video window — a video wall for a second display: an ordinary decorated OS window
+/// (move it to any screen, maximise, fullscreen) showing the fleet's live preview tiles.
+pub const FLEET_VIDEO_LABEL: &str = "fleet-video";
+/// Sent to the main window when the fleet video window is gone (closed by the user or the OS).
+pub const FLEET_VIDEO_CLOSED_EVENT: &str = "fleet-video-window-closed";
+
+#[tauri::command(async)]
+pub fn fleet_video_window_open(app: AppHandle) -> Result<(), String> {
+    #[cfg(desktop)]
+    {
+        use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+
+        if let Some(win) = app.get_webview_window(FLEET_VIDEO_LABEL) {
+            let _ = win.unminimize();
+            let _ = win.set_focus();
+            return Ok(());
+        }
+        #[allow(unused_mut)]
+        let mut builder = WebviewWindowBuilder::new(&app, FLEET_VIDEO_LABEL, WebviewUrl::App("fleet-video".into()))
+            .title("Kite Ground Control — Fleet video")
+            .resizable(true)
+            .inner_size(1280.0, 760.0)
+            .min_inner_size(480.0, 300.0);
+        // One WebView2 environment per process: the same browser arguments as the main window (see
+        // `video_detached_open`).
+        #[cfg(windows)]
+        if let Some(args) = app.config().app.windows.first().and_then(|w| w.additional_browser_args.clone()) {
+            builder = builder.additional_browser_args(&args);
+        }
+        let win = builder.build().map_err(|e| format!("fleet video window: {e}"))?;
+        let app_handle = app.clone();
+        win.on_window_event(move |event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                // Its tiles' preview streams end with it (unless the main window watches them too).
+                app_handle.state::<crate::video::preview::PreviewSessions>().stop_owner(FLEET_VIDEO_LABEL);
+                let _ = app_handle.emit_to("main", FLEET_VIDEO_CLOSED_EVENT, ());
+                log::info!("Fleet video window closed");
+            }
+        });
+        log::info!("Fleet video window opened");
+        Ok(())
+    }
+    #[cfg(not(desktop))]
+    {
+        let _ = app;
+        Err("the fleet video window is desktop-only".to_string())
+    }
+}
+
+#[tauri::command]
+pub fn fleet_video_window_close(app: AppHandle) {
+    use tauri::Manager;
+    if let Some(win) = app.get_webview_window(FLEET_VIDEO_LABEL) {
+        let _ = win.close();
+    }
+}
+
+/// Every running preview session's counters (tile status, Debug Monitor).
+#[tauri::command]
+pub fn video_preview_stats(
+    previews: State<'_, crate::video::preview::PreviewSessions>,
+) -> Vec<crate::video::preview::PreviewStats> {
+    previews.stats()
+}
+
 /// Stop the in-process native RTSP client if running. Idempotent.
 #[tauri::command(async)]
 pub fn video_rtsp_native_stop(

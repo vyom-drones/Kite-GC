@@ -1646,6 +1646,19 @@ export function setRtspUrl(rtspUrl: string): void {
   savePrefs();
 }
 
+/** Fleet video (stores/fleetVideo): point the RTSP source at the active vehicle's stream. A live RTSP feed
+ *  (or `start`) restarts on the new URL; otherwise only the URL changes, for the next Start. */
+export async function followRtspUrl(url: string, start = false): Promise<void> {
+  const st = get(videoState);
+  if (st.kind !== 'rtsp') return;
+  const changed = st.rtspUrl !== url;
+  if (changed) {
+    patch({ rtspUrl: url });
+    savePrefs();
+  }
+  if ((changed && st.enabled) || start) await startRtsp();
+}
+
 /** Set the active RTSP transport (udp/tcp/auto); restart if currently on a live RTSP feed. */
 export async function setRtspTransport(transport: RtspTransport): Promise<void> {
   patch({ rtspTransport: transport });

@@ -39,7 +39,7 @@
 
 import { writable, get } from 'svelte/store';
 import { invoke } from '@tauri-apps/api/core';
-import { isAndroid } from '$lib/platform';
+import { isAndroid, isLinux } from '$lib/platform';
 
 export type NativeSurfaceId = 'main' | 'floating' | 'widget';
 
@@ -62,6 +62,15 @@ export const activeNativeSurfaces = writable<Set<NativeSurfaceId>>(new Set());
  *  (the tablet's floating window) switches on this, not on `activeNativeSurfaces`: between the ack
  *  and the end of the slide the layer is armed but nothing is transparent yet. */
 export const openNativeSurfaces = writable<Set<NativeSurfaceId>>(new Set());
+
+// Flicker guard (Linux): a backdrop-filtered layer above the native picture — the map HUD's glass widget
+// cards — is a framebuffer readback per frame, and with the router reshaping the clip-path every frame
+// WebKitGTK flickers the picture under it (the Video widget drops its own glass for the same reason). While a
+// hole is cut, the map's glass blur is off: `html.kite-native-video` in app.html. Panels keep theirs.
+const NATIVE_VIDEO_CLASS = 'kite-native-video';
+if (isLinux && typeof document !== 'undefined') {
+  openNativeSurfaces.subscribe((open) => document.documentElement.classList.toggle(NATIVE_VIDEO_CLASS, open.size > 0));
+}
 
 /** Live geometry of the active hole for the Debug Monitor: how far the visible rect was
  *  clipped on each side (viewport px), the radius read from the surface's CSS, and which

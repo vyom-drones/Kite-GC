@@ -19,6 +19,7 @@
   import { switchVehicle } from '$lib/controllers/connectionController';
   import { groupRun, groupBusy, retryFailed } from '$lib/controllers/fleetControl';
   import { frameFleetOnMap } from '$lib/stores/mapCamera';
+  import { vehicleStreams } from '$lib/stores/fleetVideo';
   import { arduMissionStatusByVehicle, type ArduVehicleMissionStatus } from '$lib/stores/missionArdupilot';
   import { activeWpNumber } from '$lib/stores/navStatus';
   import { requestNavTab } from '$lib/stores/navRequest';
@@ -180,6 +181,7 @@
             <button class="fp-main" disabled={busy} onclick={(e) => onRowClick(e, r)}>
               <span class="fp-dot" style:background={r.color}></span>
               <span class="fp-name">{r.v.name}</span>
+              {#if $vehicleStreams.get(r.v.vehicleId)?.main}<span class="fp-cam" title={$vehicleStreams.get(r.v.vehicleId)?.main}>🎥</span>{/if}
               {#if r.active}<span class="fp-active">{$t('fleet.active')}</span>{/if}
               <span class="fp-mode" style:--mc={r.modeColor}>{r.modeText}</span>
               <span class="fp-arm" class:armed={r.armed}>{r.armed ? $t('fleet.armed') : $t('fleet.disarmed')}</span>
@@ -368,6 +370,7 @@
     box-shadow: 0 0 3px rgba(0, 0, 0, 0.6);
   }
   .fp-name { font-weight: 600; white-space: nowrap; }
+  .fp-cam { font-size: 11px; opacity: 0.8; flex: 0 0 auto; }
   .fp-active {
     font-size: 10px;
     font-weight: 600;

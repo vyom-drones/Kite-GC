@@ -17,6 +17,7 @@ pub mod parser;
 pub mod streamrates;
 pub mod tunnel;
 pub mod vehicle;
+pub mod video_streams;
 
 // MAVLink debug-stats tracker (Debug Monitor). Compiled into all builds now (was a release no-op stub)
 // so a release `--debug` run populates the MAVLink tab. Methods early-return on

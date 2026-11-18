@@ -8,17 +8,27 @@ import { writable } from 'svelte/store';
 
 const SETTINGS_TABS = ['interface', 'map', 'data'] as const;
 export type SettingsTab = (typeof SETTINGS_TABS)[number];
+const FLEET_VIDEO_TILES = ['s', 'm', 'l'] as const;
+export type FleetVideoTile = (typeof FLEET_VIDEO_TILES)[number];
+const FLEET_VIDEO_VIEWS = ['all', 'selected'] as const;
+export type FleetVideoView = (typeof FLEET_VIDEO_VIEWS)[number];
 
 export interface PanelState {
   /** Radar panel: compact (info) vs advanced (full) view. */
   radarCompact: boolean;
   /** Settings panel: which tab was last open. */
   settingsTab: SettingsTab;
+  /** Fleet video grid: tile size. */
+  fleetVideoTile: FleetVideoTile;
+  /** Fleet video grid: every drone, or only the group-selected ones (a strip above the map + main video). */
+  fleetVideoView: FleetVideoView;
 }
 
 const DEFAULTS: PanelState = {
   radarCompact: false,
   settingsTab: 'interface',
+  fleetVideoTile: 'm',
+  fleetVideoView: 'all',
 };
 
 const STORAGE_KEY = 'kite-gc-panelstate';
@@ -30,6 +40,8 @@ function load(): PanelState {
       const merged = { ...DEFAULTS, ...(JSON.parse(raw) as Partial<PanelState>) };
       // A tab that no longer exists (or a hand-edited value) falls back to the first one.
       if (!SETTINGS_TABS.includes(merged.settingsTab)) merged.settingsTab = DEFAULTS.settingsTab;
+      if (!FLEET_VIDEO_TILES.includes(merged.fleetVideoTile)) merged.fleetVideoTile = DEFAULTS.fleetVideoTile;
+      if (!FLEET_VIDEO_VIEWS.includes(merged.fleetVideoView)) merged.fleetVideoView = DEFAULTS.fleetVideoView;
       return merged;
     }
   } catch {

@@ -123,13 +123,17 @@ async function sendOne(kind: GroupCommandKind, v: VehicleSummary, p: GroupComman
     case 'takeoff': {
       // ArduPilot accepts NAV_TAKEOFF only in the Guided mode — switch first (failure surfaces via the
       // takeoff itself, exactly like the single-vehicle path).
+      const tv = get(allTelemetry).get(id);
       if (sys === 'ardupilot') {
         const g = guidedModeFor(sys, cls);
-        const tv = get(allTelemetry).get(id);
         if (g && (!tv || vehicleActiveMode(v, tv)?.key !== g.key)) {
           try { await setModeFor(v, g.main, g.sub); } catch { /* let the takeoff report the real error */ }
         }
       }
+      // Arm each vehicle right before ITS takeoff. Arming the group first and taking off staggered left the
+      // later vehicles armed on the ground past the autopilot's auto-disarm (ArduCopter DISARM_DELAY, 10 s):
+      // with a 1 s stagger, the 11th vehicle onwards disarmed before its takeoff arrived.
+      if (!tv || !isVehicleArmed(tv)) await invoke('mav_arm', { vehicleId: id, arm: true, force: !!p.force });
       await invoke('mav_takeoff', { vehicleId: id, altitude: p.altitude ?? 50 });
       return;
     }

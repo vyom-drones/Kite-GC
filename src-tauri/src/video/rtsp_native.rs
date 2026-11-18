@@ -62,7 +62,7 @@ const SPS_WAIT_AUS: u32 = 3600;
 /// One JPEG as an mpjpeg part — byte-compatible with ffmpeg's muxer output (`--ffmpeg`
 /// boundary, `Content-length` on every part), which is what the broadcast framing and all
 /// sinks already parse.
-fn mpjpeg_part(jpeg: &[u8], first: bool) -> Vec<u8> {
+pub(super) fn mpjpeg_part(jpeg: &[u8], first: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(jpeg.len() + 96);
     if !first {
         out.extend_from_slice(b"\r\n");
@@ -75,10 +75,16 @@ fn mpjpeg_part(jpeg: &[u8], first: bool) -> Vec<u8> {
 
 /// `Read` over the frame channel, so the RTSP client can stand where ffmpeg's stdout does.
 /// EOF when the sender is dropped — i.e. when the RTSP thread ends, for whatever reason.
-struct ChannelRead {
+pub(super) struct ChannelRead {
     rx: Receiver<Vec<u8>>,
     buf: Vec<u8>,
     pos: usize,
+}
+
+impl ChannelRead {
+    pub(super) fn new(rx: Receiver<Vec<u8>>) -> Self {
+        Self { rx, buf: Vec::new(), pos: 0 }
+    }
 }
 
 impl Read for ChannelRead {

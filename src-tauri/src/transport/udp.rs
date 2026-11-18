@@ -19,7 +19,7 @@
 //   HEARTBEAT goes out and wakes ArduPilot/the bridge) and then re-target to whatever source actually
 //   sends us data. This covers listen-mode bridges, client-mode SITL, and broadcast setups alike.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,9 @@ pub struct UdpTransport {
     /// headers). A frame addressed to one vehicle goes to that vehicle's peer only — on a shared radio
     /// mesh, copying every command / mission item / RC frame to every aircraft costs airtime ×N.
     sysid_peer: HashMap<u8, SocketAddr>,
+    /// System ids already reported as moving between peers. A sysid several vehicles relay (another GCS, a
+    /// SITL manager's monitor) moves on nearly every frame — logged once, not per frame.
+    route_moves_logged: HashSet<u8>,
     socket: UdpSocket,
     /// The first ICMP "port unreachable" of the session is logged at warn (a tester's log must show why
     /// nothing arrives); every further one goes to debug so a dead peer doesn't flood the log.
@@ -118,6 +121,7 @@ impl UdpTransport {
             peer,
             peers: HashMap::new(),
             sysid_peer: HashMap::new(),
+            route_moves_logged: HashSet::new(),
             socket,
             peer_unreachable_logged: false,
         })
@@ -172,10 +176,15 @@ impl ByteTransport for UdpTransport {
                     log::debug!("UDP peer learned: {} ({} peer(s) now)", src, self.peers.len());
                 }
                 for sysid in mavlink_sysids(&buf[..n]) {
-                    match self.sysid_peer.insert(sysid, src) {
-                        None => log::debug!("UDP route: sysid {} at {}", sysid, src),
-                        Some(old) if old != src => log::info!("UDP route: sysid {} moved {} → {}", sysid, old, src),
-                        Some(_) => {}
+                    match learn_route(&mut self.sysid_peer, &mut self.route_moves_logged, sysid, src) {
+                        RouteChange::Learned => log::debug!("UDP route: sysid {} at {}", sysid, src),
+                        RouteChange::Moved { old, first: true } => log::info!(
+                            "UDP route: sysid {} moved {} → {} (further moves of this sysid are logged at debug — \
+                             a sysid relayed by several vehicles moves on every frame)",
+                            sysid, old, src
+                        ),
+                        RouteChange::Moved { old, first: false } => log::debug!("UDP route: sysid {} moved {} → {}", sysid, old, src),
+                        RouteChange::Same => {}
                     }
                 }
                 Ok(n)
@@ -285,6 +294,28 @@ fn mavlink_sysids(data: &[u8]) -> Vec<u8> {
     out
 }
 
+#[derive(Debug, PartialEq)]
+enum RouteChange {
+    Learned,
+    /// `first`: the first move of this sysid this session (the one worth an info line).
+    Moved { old: SocketAddr, first: bool },
+    Same,
+}
+
+/// Record that `sysid` spoke from `src` (the route follows the latest source). Pure.
+fn learn_route(
+    routes: &mut HashMap<u8, SocketAddr>,
+    moves_logged: &mut HashSet<u8>,
+    sysid: u8,
+    src: SocketAddr,
+) -> RouteChange {
+    match routes.insert(sysid, src) {
+        None => RouteChange::Learned,
+        Some(old) if old != src => RouteChange::Moved { old, first: moves_logged.insert(sysid) },
+        Some(_) => RouteChange::Same,
+    }
+}
+
 /// Where a frame for MAVLink system `target` goes: that system's peer while it is live; `None` (= fan out
 /// to every peer) for broadcasts (`None` / 0), a system not heard yet, or one whose peer went silent.
 fn route(
@@ -334,6 +365,18 @@ mod routing_tests {
         assert!(mavlink_sysids(b"$X<\x00\x64\x00\x00\x00\x8f").is_empty()); // MSP v2 request
         assert!(mavlink_sysids(&[0xFD, 0, 0]).is_empty());
         assert!(mavlink_sysids(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_relayed_sysid_is_reported_moving_once_and_still_routed_to_the_latest_source() {
+        let (a, b): (SocketAddr, SocketAddr) = ("10.0.0.1:1".parse().unwrap(), "10.0.0.2:1".parse().unwrap());
+        let (mut routes, mut logged) = (HashMap::new(), HashSet::new());
+        assert_eq!(learn_route(&mut routes, &mut logged, 254, a), RouteChange::Learned);
+        assert_eq!(learn_route(&mut routes, &mut logged, 254, a), RouteChange::Same);
+        assert_eq!(learn_route(&mut routes, &mut logged, 254, b), RouteChange::Moved { old: a, first: true });
+        assert_eq!(learn_route(&mut routes, &mut logged, 254, a), RouteChange::Moved { old: b, first: false });
+        assert_eq!(routes.get(&254), Some(&a), "the route follows the latest source");
+        assert_eq!(learn_route(&mut routes, &mut logged, 7, b), RouteChange::Learned, "other sysids are independent");
     }
 
     #[test]

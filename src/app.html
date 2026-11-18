@@ -84,6 +84,8 @@
          drawing). The buttons keep their size. */
       :root { --map-btn-icon: 28.5px; }
       html.kite-low-power { --glass-blur: none; --panel-blur: none; }
+      /* Linux: no map glass while the native video picture shows — blur over it flickers (controllers/nativeVideo). */
+      html.kite-native-video { --glass-blur: none; }
     </style>
     <title>Tauri + SvelteKit + Typescript App</title>
     %sveltekit.head%

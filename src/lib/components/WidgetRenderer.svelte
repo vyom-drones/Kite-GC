@@ -22,6 +22,7 @@
   import TerrainRadarWidget from './widgets/TerrainRadarWidget.svelte';
   import VideoWidget from './widgets/VideoWidget.svelte';
   import WeatherWidget from './widgets/WeatherWidget.svelte';
+  import QuickActionsWidget from './widgets/QuickActionsWidget.svelte';
 
   let {
     id,
@@ -77,6 +78,8 @@
   <TerrainRadarWidget {telem} {interfaceSettings} size={sizePx} {editing} />
 {:else if id === 'weather'}
   <WeatherWidget {telem} {interfaceSettings} width={wPx} height={hPx} {small} />
+{:else if id === 'quickActions'}
+  <QuickActionsWidget {telem} width={wPx} height={hPx} {editing} />
 {:else if id === 'videoFeed'}
   <VideoWidget width={wPx} height={hPx} {ghost} />
 {/if}

@@ -1,0 +1,19 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "fleet-video-window",
+  "description": "Capability for the separate fleet video window (a video wall for a second display): its window chrome and the event channel to the main window. No dialogs, no opener, no filesystem.",
+  "platforms": [
+    "windows",
+    "linux",
+    "macOS"
+  ],
+  "windows": [
+    "fleet-video"
+  ],
+  "permissions": [
+    "core:default",
+    "core:window:allow-close",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-set-focus"
+  ]
+}

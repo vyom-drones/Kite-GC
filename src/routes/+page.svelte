@@ -16,6 +16,8 @@
   import { isDebugMode } from "$lib/stores/debug";
   import { telemetry } from "$lib/stores/telemetry";
   import { startRadarListeners, configureRadar, setRadarCenter, setRadarNode } from "$lib/stores/radarTracking";
+  import { initFleetVideo } from "$lib/stores/fleetVideo";
+  import { initFleetVideoWindow } from "$lib/controllers/fleetVideoWindow";
   import { effectiveLink } from "$lib/helpers/radarPorts";
   import { startRadarAlerts } from "$lib/controllers/radarAlerts";
   import { startBreachMonitor } from "$lib/controllers/breachMonitor";
@@ -55,6 +57,7 @@
   import MissionPanel from "$lib/components/mission/MissionPanel.svelte";
   import MavCommandPanel from "$lib/components/control/MavCommandPanel.svelte";
   import FleetPanel from "$lib/components/FleetPanel.svelte";
+  import FleetVideoGrid from "$lib/components/video/FleetVideoGrid.svelte";
   import GroupCommandBar from "$lib/components/GroupCommandBar.svelte";
   import { vehicles } from "$lib/stores/vehicles";
   import { selectedVehicleIds } from "$lib/stores/fleetSelection";
@@ -855,6 +858,8 @@
   const ICON_TERRAIN = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M1.5 20 8.5 5 13 14 16.5 8.5 22.5 20Z"/></svg>';
   // Fleet (multi-vehicle list + group commands): three craft arrows inside a corner frame.
   const ICON_FLEET = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8V4h4M17 4h4v4M21 16v4h-4M7 20H3v-4"/><polygon points="12,7 9.6,13 12,11.8 14.4,13" fill="currentColor" stroke="none"/><polygon points="7.5,12 5.1,18 7.5,16.8 9.9,18" fill="currentColor" stroke="none"/><polygon points="16.5,12 14.1,18 16.5,16.8 18.9,18" fill="currentColor" stroke="none"/></svg>';
+  // Four video tiles, play mark in the first (Fleet video grid).
+  const ICON_FLEET_VIDEO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><rect x="3" y="5" width="8" height="6" rx="1"/><rect x="13" y="5" width="8" height="6" rx="1"/><rect x="3" y="13" width="8" height="6" rx="1"/><rect x="13" y="13" width="8" height="6" rx="1"/><polygon points="6,6.8 6,9.2 8.2,8" fill="currentColor" stroke="none"/></svg>';
   // Solid flat movie camera (Video): two reels + body + lens funnel.
   const ICON_VIDEO = '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="7" cy="7" r="2.9"/><circle cx="12.6" cy="7" r="2.9"/><rect x="2.5" y="9.5" width="13" height="9" rx="1.6"/><path d="M15.5 12 21.5 9.5V18.5L15.5 16Z"/></svg>';
   // Radar scope: range rings + sweep line + contact blip (Radar / foreign-vehicle tracking).
@@ -901,6 +906,7 @@
     { id: "mission", label: () => $t('nav.mission'), icon: ICON_MISSION },
     { id: "control", label: () => $t('nav.control'), icon: ICON_CONTROL },
     { id: "fleet", label: () => $t('nav.fleet'), icon: ICON_FLEET },
+    { id: "fleet-video", label: () => $t('nav.fleetVideo'), icon: ICON_FLEET_VIDEO },
     { id: "rc-control", label: () => $t('nav.rc'), icon: ICON_RC },
     { id: "terrain", label: () => $t('nav.terrain'), icon: ICON_TERRAIN },
     { id: "logbook", label: () => $t('nav.logbook'), icon: ICON_LOGBOOK },
@@ -919,13 +925,14 @@
   // With the gate off, a Fleet tab restored from the last session (or open when it was switched off) must
   // not stay rendered — the same fallback as the RC tab above.
   $effect(() => {
-    if (!$fleetEnabled && activeTab === 'fleet') activeTab = 'uav-info';
+    if (!$fleetEnabled && (activeTab === 'fleet' || activeTab === 'fleet-video')) activeTab = 'uav-info';
   });
   const tabs = $derived(
     allTabs.filter(t =>
       (t.id !== 'logbook' || flightLoggingEnabled) &&
       (t.id !== 'control' || isMavlinkConnected) && // control tab only when connected via MAVLink
       (t.id !== 'fleet' || fleetTabAvailable) &&
+      (t.id !== 'fleet-video' || fleetTabAvailable) &&
       (t.id !== 'rc-control' || (rcTabAvailable && !isMobile) || mobileRcAvailable) && // RC tab: desktop needs the master switch + a joystick; mobile uses on-screen sticks when a FC is connected
       (t.id !== 'radar' || radarSettings.enabled) && // radar tab only when the master switch is on
       (t.id !== 'airspace' || airspaceSettings.enabled || geozonesAvailable || fenceAvailable || rallyAvailable) // airspace: master switch, or geozone (INAV) / fence+rally (MAVLink) capable FC
@@ -1203,6 +1210,8 @@
   }
   if (typeof window !== 'undefined') {
     void startRadarListeners();
+    initFleetVideo();
+    void initFleetVideoWindow();
     startRadarAlerts();
     startAlertAudio();
     void startStatusText();
@@ -4273,6 +4282,8 @@
           <MavCommandPanel />
         {:else if activeTab === 'fleet'}
           <FleetPanel />
+        {:else if activeTab === 'fleet-video'}
+          <FleetVideoGrid />
         {:else if activeTab === 'rc-control'}
           {#if isMobile}
             <VirtualSticks />
