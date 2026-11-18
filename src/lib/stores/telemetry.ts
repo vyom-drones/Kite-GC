@@ -411,6 +411,25 @@ export function stopConnectListeners() {
   blackboxByVehicle.clear();
 }
 
+// Fleet batching: the backend holds the high-rate state events of every NON-active vehicle and publishes
+// them together as one `fleet-telemetry` event at ~5 Hz (src-tauri vehicle_registry/coalesce.rs), so a
+// fleet can't flood this thread with hundreds of events per second. Each batched entry is replayed into
+// the handler its plain event would have reached; the active vehicle's events still arrive one by one.
+const FLEET_EVENT = 'fleet-telemetry';
+interface FleetBatch { events: { event: string; payload: unknown }[] }
+type LiveHandler = (event: { payload: never }) => void;
+const liveHandlers = new Map<string, LiveHandler>();
+
+function listenLive<T>(name: string, handler: (event: { payload: T }) => void): Promise<UnlistenFn> {
+  liveHandlers.set(name, handler);
+  return listen<T>(name, handler);
+}
+
+/** Replay one fleet batch. Unknown event names (no live handler here) are skipped. */
+export function replayFleetBatch(batch: FleetBatch): void {
+  for (const e of batch.events) liveHandlers.get(e.event)?.({ payload: e.payload as never });
+}
+
 export function startTelemetryListeners(): Promise<void> {
   if (startingListeners) return startingListeners;
   startingListeners = startTelemetryListenersInner().finally(() => { startingListeners = null; });
@@ -423,7 +442,7 @@ async function startTelemetryListenersInner() {
   unlisteners = fresh;
 
   fresh.push(
-    await listen<{ roll: number; pitch: number; yaw: number }>('telemetry-attitude', (event) => {
+    await listenLive<{ roll: number; pitch: number; yaw: number }>('telemetry-attitude', (event) => {
       upd(event.payload, (t) => ({
         ...t,
         roll: event.payload.roll,
@@ -435,7 +454,7 @@ async function startTelemetryListenersInner() {
   );
 
   fresh.push(
-    await listen<{
+    await listenLive<{
       fix_type: number; num_sat: number;
       lat: number; lon: number; alt_msl: number;
       ground_speed: number; course: number;
@@ -460,7 +479,7 @@ async function startTelemetryListenersInner() {
   );
 
   fresh.push(
-    await listen<{ altitude: number; vario: number }>('telemetry-altitude', (event) => {
+    await listenLive<{ altitude: number; vario: number }>('telemetry-altitude', (event) => {
       upd(event.payload, (t) => ({
         ...t,
         altitude: event.payload.altitude,
@@ -471,7 +490,7 @@ async function startTelemetryListenersInner() {
   );
 
   fresh.push(
-    await listen<{
+    await listenLive<{
       voltage: number; mah_drawn: number; rssi: number; current: number;
       power: number; battery_percentage: number; cell_count: number;
     }>(
@@ -494,7 +513,7 @@ async function startTelemetryListenersInner() {
   );
 
   fresh.push(
-    await listen<{ throttle_pct: number; auto_throttle: boolean; uptime_s: number; flight_time_s: number }>(
+    await listenLive<{ throttle_pct: number; auto_throttle: boolean; uptime_s: number; flight_time_s: number }>(
       'telemetry-misc2',
       (event) => {
         // Only throttle is consumed continuously today; uptime/flight_time ride along for a future
@@ -505,7 +524,7 @@ async function startTelemetryListenersInner() {
   );
 
   fresh.push(
-    await listen<{ value: { id: number; fix_type: number; fix_raw: number; num_sat: number; hdop: number | null; lat: number; lon: number; alt_msl: number }[] }>(
+    await listenLive<{ value: { id: number; fix_type: number; fix_raw: number; num_sat: number; hdop: number | null; lat: number; lon: number; alt_msl: number }[] }>(
       'telemetry-gps-receivers',
       (event) => {
         const gpsReceivers: GpsReceiver[] = event.payload.value.map((r) => ({
@@ -524,7 +543,7 @@ async function startTelemetryListenersInner() {
   );
 
   fresh.push(
-    await listen<{ value: { id: number; voltage: number; current: number; mah_drawn: number; percentage: number; cell_count: number; temperature: number | null }[] }>(
+    await listenLive<{ value: { id: number; voltage: number; current: number; mah_drawn: number; percentage: number; cell_count: number; temperature: number | null }[] }>(
       'telemetry-batteries',
       (event) => {
         const batteries: BatteryInstance[] = event.payload.value.map((b) => ({
@@ -542,7 +561,7 @@ async function startTelemetryListenersInner() {
   );
 
   fresh.push(
-    await listen<{ rssi_percent: number | null; rssi_dbm: number | null; lq: number | null; snr_db: number | null }>(
+    await listenLive<{ rssi_percent: number | null; rssi_dbm: number | null; lq: number | null; snr_db: number | null }>(
       'telemetry-linkstats',
       (event) => {
         const p = event.payload;
@@ -556,7 +575,7 @@ async function startTelemetryListenersInner() {
   );
 
   fresh.push(
-    await listen<{ arming_flags: number; flight_mode_flags: number; cpu_load: number; sensor_status: number; msp_rc_override?: boolean }>('telemetry-status', (event) => {
+    await listenLive<{ arming_flags: number; flight_mode_flags: number; cpu_load: number; sensor_status: number; msp_rc_override?: boolean }>('telemetry-status', (event) => {
       // flight_mode_flags is forensic only; the canonical mode comes via telemetry-flightmode.
       upd(event.payload, (t) => ({
         ...t,
@@ -572,7 +591,7 @@ async function startTelemetryListenersInner() {
   );
 
   fresh.push(
-    await listen<FlightModeState>('telemetry-flightmode', (event) => {
+    await listenLive<FlightModeState>('telemetry-flightmode', (event) => {
       upd(event.payload, (t) => ({
         ...t,
         flightMode: { primary: event.payload.primary, modifiers: event.payload.modifiers ?? [] },
@@ -582,7 +601,7 @@ async function startTelemetryListenersInner() {
   );
 
   fresh.push(
-    await listen<{
+    await listenLive<{
       gyro: number; acc: number; mag: number; baro: number;
       gps: number; rangefinder: number; pitot: number; opflow: number; prearm: number;
       rc_receiver: number;
@@ -607,13 +626,13 @@ async function startTelemetryListenersInner() {
 
   // EKF estimator health (ArduPilot) — drives the header EKF indicator.
   fresh.push(
-    await listen<{ status: number; max_variance: number; flags: number }>('telemetry-ekf-status', (event) => {
+    await listenLive<{ status: number; max_variance: number; flags: number }>('telemetry-ekf-status', (event) => {
       upd(event.payload, (t) => ({ ...t, ekfStatus: event.payload.status, lastUpdate: Date.now() }));
     })
   );
 
   fresh.push(
-    await listen<{ active_wp_number: number; nav_state: number }>('telemetry-nav-status', (event) => {
+    await listenLive<{ active_wp_number: number; nav_state: number }>('telemetry-nav-status', (event) => {
       upd(event.payload, (t) => ({
         ...t,
         activeWpNumber: event.payload.active_wp_number,
@@ -624,7 +643,7 @@ async function startTelemetryListenersInner() {
   );
 
   fresh.push(
-    await listen<{ airspeed: number }>('telemetry-airspeed', (event) => {
+    await listenLive<{ airspeed: number }>('telemetry-airspeed', (event) => {
       upd(event.payload, (t) => ({
         ...t,
         airspeed: event.payload.airspeed,
@@ -634,7 +653,7 @@ async function startTelemetryListenersInner() {
   );
 
   fresh.push(
-    await listen<{ direction_from_deg: number; speed_ms: number }>('telemetry-wind', (event) => {
+    await listenLive<{ direction_from_deg: number; speed_ms: number }>('telemetry-wind', (event) => {
       upd(event.payload, (t) => ({
         ...t,
         windDirFrom: event.payload.direction_from_deg,
@@ -646,14 +665,14 @@ async function startTelemetryListenersInner() {
 
   // FC-link liveness (passive): fresh FC-origin frames, independent of the cached-state re-emit + RX noise.
   fresh.push(
-    await listen<{ alive: boolean }>('telemetry-fc-link', (event) => {
+    await listenLive<{ alive: boolean }>('telemetry-fc-link', (event) => {
       if (!isActive(event.payload)) return;
       fcLinkAlive.set(event.payload.alive);
     })
   );
 
   fresh.push(
-    await listen<{ hdop: number }>('telemetry-gps-stats', (event) => {
+    await listenLive<{ hdop: number }>('telemetry-gps-stats', (event) => {
       upd(event.payload, (t) => ({
         ...t,
         // Ignore invalid values to avoid one-frame UI oscillation.
@@ -662,6 +681,8 @@ async function startTelemetryListenersInner() {
       }));
     })
   );
+
+  fresh.push(await listen<FleetBatch>(FLEET_EVENT, (event) => replayFleetBatch(event.payload)));
 }
 
 export function stopTelemetryListeners() {

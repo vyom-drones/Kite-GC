@@ -59,10 +59,14 @@ impl VehicleEmitter {
         &self.app
     }
 
-    /// Emit `event` app-wide with the payload stamped with this vehicle's ids.
+    /// Emit `event` app-wide with the payload stamped with this vehicle's ids. A state event of a
+    /// non-active vehicle is held for the next fleet batch instead (`coalesce`).
     pub fn emit<S: Serialize>(&self, event: &str, payload: S) -> tauri::Result<()> {
-        let value = serde_json::to_value(payload)?;
-        self.app.emit(event, stamp(value, &self.key, self.id.link))
+        let value = stamp(serde_json::to_value(payload)?, &self.key, self.id.link);
+        match super::coalesce::offer(&self.app, &self.key, event, value) {
+            Some(value) => self.app.emit(event, value),
+            None => Ok(()),
+        }
     }
 }
 

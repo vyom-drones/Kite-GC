@@ -102,13 +102,14 @@ fn skip_foreign_wind(msg_id: f32, is_px4: bool) -> bool {
     (msg_id == ID_WIND && is_px4) || (msg_id == ID_WIND_COV && !is_px4)
 }
 
-/// Resolve a rate kind to Hz against the two settings.
-fn rate_hz(kind: u8, attitude_hz: f64, position_hz: f64) -> f32 {
+/// Resolve a rate kind to Hz against the two settings (`fixed_hz`: the R_FIXED_1HZ group's rate —
+/// 1 Hz for the active vehicle, lower in the fleet profile).
+fn rate_hz(kind: u8, attitude_hz: f64, position_hz: f64, fixed_hz: f32) -> f32 {
     match kind {
         R_ATTITUDE => attitude_hz as f32,
         R_POSITION => position_hz as f32,
         R_HOME_LOW => 0.2,
-        _ => 1.0, // R_FIXED_1HZ
+        _ => fixed_hz, // R_FIXED_1HZ
     }
 }
 
@@ -122,21 +123,23 @@ fn hz_to_interval_us(hz: f32) -> f32 {
     }
 }
 
-/// Apply the reduced GCS-requested stream rates (default mode): wanted messages at the two knobs,
-/// ballast disabled. Fire-and-forget over the (pre-handler) byte transport.
-pub fn apply_stream_rates(
-    transport: &mut dyn ByteTransport,
-    fc_sysid: u8,
+/// Fleet profile — a vehicle that is NOT the active one on a multi-vehicle link: what a fleet list and a
+/// map marker need, at a fraction of the airtime (a shared radio mesh carries every vehicle's stream).
+/// The active vehicle gets the full profile; switching the active vehicle swaps the two.
+pub const FLEET_ATTITUDE_HZ: f64 = 1.0;
+pub const FLEET_POSITION_HZ: f64 = 2.0;
+pub const FLEET_FIXED_HZ: f32 = 0.5;
+
+/// Every SET_MESSAGE_INTERVAL a profile sends: (message id, interval µs; -1 = disabled). Pure.
+fn planned_intervals(
     attitude_hz: f64,
     position_hz: f64,
+    fixed_hz: f32,
     airspeed_enabled: bool,
     wind_enabled: bool,
     is_px4: bool,
-) {
-    let header = codec::gcs_header();
-    let mut seq = MavSequence::new();
-
-    let mut sent = 0usize;
+) -> Vec<(f32, f32)> {
+    let mut out = Vec::with_capacity(WANTED.len() + BALLAST_IDS.len());
     for &(msg_id, kind) in WANTED {
         if skip_foreign_wind(msg_id, is_px4) {
             continue;
@@ -149,17 +152,42 @@ pub fn apply_stream_rates(
         {
             -1.0
         } else {
-            hz_to_interval_us(rate_hz(kind, attitude_hz, position_hz))
+            hz_to_interval_us(rate_hz(kind, attitude_hz, position_hz, fixed_hz))
         };
-        if send_set_interval(transport, &header, &mut seq, fc_sysid, msg_id, interval) {
-            sent += 1;
-        }
+        out.push((msg_id, interval));
     }
-    for &msg_id in BALLAST_IDS {
-        if send_set_interval(transport, &header, &mut seq, fc_sysid, msg_id, -1.0) {
-            sent += 1;
-        }
-    }
+    out.extend(BALLAST_IDS.iter().map(|&id| (id, -1.0)));
+    out
+}
+
+fn send_plan(transport: &mut dyn ByteTransport, fc_sysid: u8, plan: &[(f32, f32)]) -> usize {
+    let header = codec::gcs_header();
+    let mut seq = MavSequence::new();
+    plan.iter()
+        .filter(|&&(msg_id, interval)| send_set_interval(transport, &header, &mut seq, fc_sysid, msg_id, interval))
+        .count()
+}
+
+/// Apply the fleet profile to `fc_sysid` (see `FLEET_*`): airspeed and wind off.
+pub fn apply_fleet_stream_rates(transport: &mut dyn ByteTransport, fc_sysid: u8, is_px4: bool) {
+    let plan = planned_intervals(FLEET_ATTITUDE_HZ, FLEET_POSITION_HZ, FLEET_FIXED_HZ, false, false, is_px4);
+    let sent = send_plan(transport, fc_sysid, &plan);
+    log::debug!("MAVLink rates: fleet profile → sysid={} ({} SET_MESSAGE_INTERVAL)", fc_sysid, sent);
+}
+
+/// Apply the reduced GCS-requested stream rates (default mode): wanted messages at the two knobs,
+/// ballast disabled. Fire-and-forget over the (pre-handler) byte transport.
+pub fn apply_stream_rates(
+    transport: &mut dyn ByteTransport,
+    fc_sysid: u8,
+    attitude_hz: f64,
+    position_hz: f64,
+    airspeed_enabled: bool,
+    wind_enabled: bool,
+    is_px4: bool,
+) {
+    let plan = planned_intervals(attitude_hz, position_hz, 1.0, airspeed_enabled, wind_enabled, is_px4);
+    let sent = send_plan(transport, fc_sysid, &plan);
 
     eprintln!(
         "[MAVLINK-RATES] reduced stream config: attitude={:.0}Hz, position={:.0}Hz, airspeed={}, {} SET_MESSAGE_INTERVAL sent ({} disabled)",
@@ -218,11 +246,68 @@ fn send_set_interval(
         param7: 0.0,
     });
     let frame = codec::serialize_v2(header, &cmd, seq);
-    match transport.write_bytes(&frame) {
+    match transport.write_bytes_to(codec::target_of(&cmd), &frame) {
         Ok(()) => true,
         Err(e) => {
             log::warn!("Failed to send SET_MESSAGE_INTERVAL for msg {}: {}", msg_id as u32, e);
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn interval_of(plan: &[(f32, f32)], id: f32) -> Option<f32> {
+        plan.iter().find(|(m, _)| *m == id).map(|(_, i)| *i)
+    }
+
+    /// Messages per second a plan asks for (disabled entries count 0).
+    fn msgs_per_sec(plan: &[(f32, f32)]) -> f32 {
+        plan.iter().filter(|(_, i)| *i > 0.0).map(|(_, i)| 1_000_000.0 / i).sum()
+    }
+
+    #[test]
+    fn active_profile_uses_the_two_knobs_and_1hz_for_the_rest() {
+        let plan = planned_intervals(10.0, 5.0, 1.0, true, true, false);
+        assert_eq!(interval_of(&plan, ID_ATTITUDE), Some(100_000.0));
+        assert_eq!(interval_of(&plan, ID_GLOBAL_POSITION_INT), Some(200_000.0));
+        assert_eq!(interval_of(&plan, ID_SYS_STATUS), Some(1_000_000.0));
+        assert_eq!(interval_of(&plan, ID_VFR_HUD), Some(200_000.0), "airspeed on");
+        assert_eq!(interval_of(&plan, ID_HOME_POSITION), Some(5_000_000.0));
+    }
+
+    #[test]
+    fn fleet_profile_is_low_rate_with_airspeed_and_wind_off() {
+        let plan = planned_intervals(FLEET_ATTITUDE_HZ, FLEET_POSITION_HZ, FLEET_FIXED_HZ, false, false, false);
+        assert_eq!(interval_of(&plan, ID_ATTITUDE), Some(1_000_000.0));
+        assert_eq!(interval_of(&plan, ID_GLOBAL_POSITION_INT), Some(500_000.0));
+        assert_eq!(interval_of(&plan, ID_SYS_STATUS), Some(2_000_000.0));
+        assert_eq!(interval_of(&plan, ID_VFR_HUD), Some(-1.0));
+        assert_eq!(interval_of(&plan, ID_WIND), Some(-1.0));
+        assert_eq!(interval_of(&plan, ID_HOME_POSITION), Some(5_000_000.0), "home stays at its low rate");
+        assert!(msgs_per_sec(&plan) < 8.0, "fleet profile asks for {} msg/s", msgs_per_sec(&plan));
+        assert!(msgs_per_sec(&plan) * 2.0 < msgs_per_sec(&planned_intervals(10.0, 5.0, 1.0, true, true, false)));
+    }
+
+    #[test]
+    fn every_profile_disables_the_ballast() {
+        for plan in [
+            planned_intervals(10.0, 5.0, 1.0, true, true, false),
+            planned_intervals(FLEET_ATTITUDE_HZ, FLEET_POSITION_HZ, FLEET_FIXED_HZ, false, false, true),
+        ] {
+            for id in BALLAST_IDS {
+                assert_eq!(interval_of(&plan, *id), Some(-1.0), "ballast {id}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_firmwares_own_wind_message_is_planned() {
+        let ardu = planned_intervals(10.0, 5.0, 1.0, true, true, false);
+        let px4 = planned_intervals(10.0, 5.0, 1.0, true, true, true);
+        assert!(interval_of(&ardu, ID_WIND).is_some() && interval_of(&ardu, ID_WIND_COV).is_none());
+        assert!(interval_of(&px4, ID_WIND_COV).is_some() && interval_of(&px4, ID_WIND).is_none());
     }
 }

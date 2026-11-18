@@ -38,7 +38,7 @@ pub fn request_param(transport: &mut dyn ByteTransport, fc_sysid: u8, name: &str
         param_id: pack_param_id(name).into(),
     });
     let frame = codec::serialize_v2(&header, &msg, &mut seq);
-    match transport.write_bytes(&frame) {
+    match transport.write_bytes_to(codec::target_of(&msg), &frame) {
         Ok(()) => eprintln!("[MAVLINK-PARAM] requested {}", name),
         Err(e) => log::warn!("Failed to request {}: {}", name, e),
     }
@@ -84,7 +84,7 @@ pub fn request_home_position(transport: &mut dyn ByteTransport, fc_sysid: u8) {
         param7: 0.0,
     });
     let frame = codec::serialize_v2(&header, &msg, &mut seq);
-    match transport.write_bytes(&frame) {
+    match transport.write_bytes_to(codec::target_of(&msg), &frame) {
         Ok(()) => eprintln!("[MAVLINK-PARAM] requested HOME_POSITION"),
         Err(e) => log::warn!("Failed to request HOME_POSITION: {}", e),
     }

@@ -29,6 +29,22 @@ const AUTOPILOT_COMPONENT: u8 = 1;
 /// How long we wait for the COMMAND_ACK before giving up. Commands are cheap; the FC acks fast.
 const ACK_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Retransmission (MAVLink command protocol): on a lossy link (a radio mesh) the command or its ACK
+/// can be lost, and one lost datagram used to fail the whole command after ACK_TIMEOUT — an RTL to a
+/// fleet left some aircraft unreached. Resend after `interval` without an ACK, up to `attempts` sends;
+/// COMMAND_LONG counts the resend in `confirmation`. Any final ACK (accepted or not) ends it; an
+/// IN_PROGRESS ack stops resending and waits up to `final_wait` for the result. The worst case stays
+/// ACK_TIMEOUT (3 × 1 s), as before.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RetryPolicy {
+    pub interval: Duration,
+    pub attempts: u8,
+    pub final_wait: Duration,
+}
+
+pub(crate) const COMMAND_RETRY: RetryPolicy =
+    RetryPolicy { interval: Duration::from_secs(1), attempts: 3, final_wait: ACK_TIMEOUT };
+
 /// Send a `COMMAND_LONG` and wait for its `COMMAND_ACK`. `params` are param1..param7.
 pub fn send_command_long(
     cmd_tx: &mpsc::Sender<MavlinkCommand>,
@@ -36,27 +52,21 @@ pub fn send_command_long(
     command: MavCmd,
     params: [f32; 7],
 ) -> Result<(), String> {
-    let rx = register(cmd_tx, fc_sysid)?;
-    let msg = MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
-        target_system: fc_sysid,
-        target_component: AUTOPILOT_COMPONENT,
-        command,
-        confirmation: 0,
-        param1: params[0],
-        param2: params[1],
-        param3: params[2],
-        param4: params[3],
-        param5: params[4],
-        param6: params[5],
-        param7: params[6],
-    });
-    if let Err(e) = send(cmd_tx, msg) {
-        unregister(cmd_tx);
-        return Err(e);
-    }
-    let result = wait_for_ack(&rx, command, ACK_TIMEOUT);
-    unregister(cmd_tx);
-    result
+    command_with_retries(cmd_tx, fc_sysid, command, COMMAND_RETRY, |attempt| {
+        MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+            target_system: fc_sysid,
+            target_component: AUTOPILOT_COMPONENT,
+            command,
+            confirmation: attempt,
+            param1: params[0],
+            param2: params[1],
+            param3: params[2],
+            param4: params[3],
+            param5: params[4],
+            param6: params[5],
+            param7: params[6],
+        })
+    })
 }
 
 /// Send a `COMMAND_INT` and wait for its `COMMAND_ACK`. Used for commands carrying a global
@@ -73,28 +83,57 @@ pub fn send_command_int(
     y: i32,
     z: f32,
 ) -> Result<(), String> {
-    let rx = register(cmd_tx, fc_sysid)?;
-    let msg = MavMessage::COMMAND_INT(COMMAND_INT_DATA {
-        target_system: fc_sysid,
-        target_component: AUTOPILOT_COMPONENT,
-        frame,
-        command,
-        current: 0,
-        autocontinue: 0,
-        param1: params[0],
-        param2: params[1],
-        param3: params[2],
-        param4: params[3],
-        x,
-        y,
-        z,
-    });
-    if let Err(e) = send(cmd_tx, msg) {
-        unregister(cmd_tx);
-        return Err(e);
-    }
-    let result = wait_for_ack(&rx, command, ACK_TIMEOUT);
-    unregister(cmd_tx);
+    // COMMAND_INT has no `confirmation` field: a resend is identical.
+    command_with_retries(cmd_tx, fc_sysid, command, COMMAND_RETRY, |_attempt| {
+        MavMessage::COMMAND_INT(COMMAND_INT_DATA {
+            target_system: fc_sysid,
+            target_component: AUTOPILOT_COMPONENT,
+            frame,
+            command,
+            current: 0,
+            autocontinue: 0,
+            param1: params[0],
+            param2: params[1],
+            param3: params[2],
+            param4: params[3],
+            x,
+            y,
+            z,
+        })
+    })
+}
+
+/// Register for `sysid`'s ACKs, send `build(attempt)` until a final ACK arrives (see `RetryPolicy`),
+/// unregister. `attempt` is 0 for the first send.
+pub(crate) fn command_with_retries(
+    cmd_tx: &mpsc::Sender<MavlinkCommand>,
+    sysid: u8,
+    command: MavCmd,
+    policy: RetryPolicy,
+    mut build: impl FnMut(u8) -> MavMessage,
+) -> Result<(), String> {
+    let rx = register(cmd_tx, sysid)?;
+    let result = (|| {
+        for attempt in 0..policy.attempts {
+            if attempt > 0 {
+                log::debug!("MAVLink {:?} → sysid={}: no ACK, resend #{}", command, sysid, attempt);
+            }
+            send(cmd_tx, build(attempt))?;
+            match wait_for_ack(&rx, command, policy.interval)? {
+                AckWait::Final(r) => {
+                    if attempt > 0 {
+                        log::info!("MAVLink {:?} → sysid={}: ACK after {} resend(s)", command, sysid, attempt);
+                    }
+                    return r;
+                }
+                AckWait::InProgress => return wait_final(&rx, command, policy.final_wait),
+                AckWait::Silent => {}
+            }
+        }
+        log::warn!("MAVLink {:?} → sysid={}: no COMMAND_ACK after {} send(s)", command, sysid, policy.attempts);
+        Err("No COMMAND_ACK from FC (timed out)".to_string())
+    })();
+    unregister(cmd_tx, sysid);
     result
 }
 
@@ -172,8 +211,8 @@ fn register(cmd_tx: &mpsc::Sender<MavlinkCommand>, sysid: u8) -> Result<mpsc::Re
     Ok(rx)
 }
 
-fn unregister(cmd_tx: &mpsc::Sender<MavlinkCommand>) {
-    let _ = cmd_tx.send(MavlinkCommand::UnregisterCommandReceiver);
+fn unregister(cmd_tx: &mpsc::Sender<MavlinkCommand>, sysid: u8) {
+    let _ = cmd_tx.send(MavlinkCommand::UnregisterCommandReceiver { sysid });
 }
 
 fn send(cmd_tx: &mpsc::Sender<MavlinkCommand>, msg: MavMessage) -> Result<(), String> {
@@ -184,42 +223,174 @@ fn send(cmd_tx: &mpsc::Sender<MavlinkCommand>, msg: MavMessage) -> Result<(), St
         .map_err(|_| "MAVLink send timed out".to_string())?
 }
 
-/// Wait for the COMMAND_ACK that matches `command`. `IN_PROGRESS` acks are intermediate (some
-/// commands report progress) — keep waiting for the final result.
-fn wait_for_ack(
-    rx: &mpsc::Receiver<MavMessage>,
-    command: MavCmd,
-    timeout: Duration,
-) -> Result<(), String> {
+/// What one wait window produced.
+#[derive(Debug, PartialEq)]
+enum AckWait {
+    /// A final ACK for the command (accepted, or the FC's refusal as the error text).
+    Final(Result<(), String>),
+    /// The FC acknowledged it is working on it — stop resending.
+    InProgress,
+    /// Nothing for this command inside the window.
+    Silent,
+}
+
+/// The outcome of a final ACK result; `None` for IN_PROGRESS (not final).
+fn ack_outcome(result: MavResult) -> Option<Result<(), String>> {
+    Some(match result {
+        MavResult::MAV_RESULT_ACCEPTED => Ok(()),
+        MavResult::MAV_RESULT_IN_PROGRESS => return None,
+        MavResult::MAV_RESULT_TEMPORARILY_REJECTED => Err("Command temporarily rejected — try again".into()),
+        MavResult::MAV_RESULT_DENIED => Err("Command denied by the flight controller".into()),
+        MavResult::MAV_RESULT_UNSUPPORTED => Err("Command not supported by this firmware".into()),
+        MavResult::MAV_RESULT_FAILED => Err("Command failed on the flight controller".into()),
+        other => Err(format!("Command rejected: {:?}", other)),
+    })
+}
+
+/// Wait up to `timeout` for an ACK matching `command`. `Err` only when the handler is gone.
+fn wait_for_ack(rx: &mpsc::Receiver<MavMessage>, command: MavCmd, timeout: Duration) -> Result<AckWait, String> {
     let deadline = Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Err("No COMMAND_ACK from FC (timed out)".into());
+            return Ok(AckWait::Silent);
         }
         match rx.recv_timeout(remaining) {
             Ok(MavMessage::COMMAND_ACK(ack)) if ack.command == command => {
-                return match ack.result {
-                    MavResult::MAV_RESULT_ACCEPTED => Ok(()),
-                    MavResult::MAV_RESULT_IN_PROGRESS => continue,
-                    MavResult::MAV_RESULT_TEMPORARILY_REJECTED =>
-                        Err("Command temporarily rejected — try again".into()),
-                    MavResult::MAV_RESULT_DENIED =>
-                        Err("Command denied by the flight controller".into()),
-                    MavResult::MAV_RESULT_UNSUPPORTED =>
-                        Err("Command not supported by this firmware".into()),
-                    MavResult::MAV_RESULT_FAILED =>
-                        Err("Command failed on the flight controller".into()),
-                    other => Err(format!("Command rejected: {:?}", other)),
-                };
+                return Ok(match ack_outcome(ack.result) {
+                    Some(r) => AckWait::Final(r),
+                    None => AckWait::InProgress,
+                });
             }
             Ok(_) => continue, // ack for a different command, or stray msg — keep waiting
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                return Err("No COMMAND_ACK from FC (timed out)".into());
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err("MAVLink handler stopped".into());
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => return Ok(AckWait::Silent),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err("MAVLink handler stopped".into()),
         }
+    }
+}
+
+/// After IN_PROGRESS: wait for the final result (further IN_PROGRESS acks keep waiting).
+fn wait_final(rx: &mpsc::Receiver<MavMessage>, command: MavCmd, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match wait_for_ack(rx, command, deadline.saturating_duration_since(Instant::now()))? {
+            AckWait::Final(r) => return r,
+            AckWait::InProgress => continue,
+            AckWait::Silent => return Err("No COMMAND_ACK from FC (timed out)".into()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ::mavlink::ardupilotmega::COMMAND_ACK_DATA;
+
+    const FAST: RetryPolicy =
+        RetryPolicy { interval: Duration::from_millis(60), attempts: 3, final_wait: Duration::from_millis(300) };
+    const CMD: MavCmd = MavCmd::MAV_CMD_DO_SET_MODE;
+
+    fn ack(result: MavResult) -> MavMessage {
+        MavMessage::COMMAND_ACK(COMMAND_ACK_DATA { command: CMD, result, ..Default::default() })
+    }
+
+    /// Stand-in for the handler thread: records the `confirmation` of every COMMAND_LONG sent and, on
+    /// the send numbered `ack_on` (0-based), answers with `acks` in order. Returns the recorded sends.
+    fn run(ack_on: Option<usize>, acks: Vec<MavMessage>) -> (Result<(), String>, Vec<u8>) {
+        let (tx, rx) = mpsc::channel::<MavlinkCommand>();
+        let handler = std::thread::spawn(move || {
+            let mut ack_tx: Option<mpsc::Sender<MavMessage>> = None;
+            let mut sends = Vec::new();
+            while let Ok(cmd) = rx.recv() {
+                match cmd {
+                    MavlinkCommand::RegisterCommandReceiver { sysid, tx } => {
+                        assert_eq!(sysid, 7);
+                        ack_tx = Some(tx);
+                    }
+                    MavlinkCommand::UnregisterCommandReceiver { sysid } => {
+                        assert_eq!(sysid, 7);
+                        break;
+                    }
+                    MavlinkCommand::SendMessage { msg, reply } => {
+                        if let MavMessage::COMMAND_LONG(c) = &msg {
+                            assert_eq!(c.target_system, 7);
+                            sends.push(c.confirmation);
+                        }
+                        let _ = reply.send(Ok(()));
+                        if ack_on == Some(sends.len() - 1) {
+                            for a in &acks {
+                                let _ = ack_tx.as_ref().expect("registered before send").send(a.clone());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            sends
+        });
+        let result = command_with_retries(&tx, 7, CMD, FAST, |attempt| {
+            MavMessage::COMMAND_LONG(COMMAND_LONG_DATA {
+                target_system: 7,
+                command: CMD,
+                confirmation: attempt,
+                ..Default::default()
+            })
+        });
+        (result, handler.join().expect("fake handler"))
+    }
+
+    #[test]
+    fn first_ack_ends_it_without_resend() {
+        let (r, sends) = run(Some(0), vec![ack(MavResult::MAV_RESULT_ACCEPTED)]);
+        assert_eq!(r, Ok(()));
+        assert_eq!(sends, vec![0]);
+    }
+
+    #[test]
+    fn lost_sends_are_retried_with_rising_confirmation() {
+        let (r, sends) = run(Some(2), vec![ack(MavResult::MAV_RESULT_ACCEPTED)]);
+        assert_eq!(r, Ok(()));
+        assert_eq!(sends, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn no_ack_at_all_times_out_after_every_attempt() {
+        let (r, sends) = run(None, vec![]);
+        assert_eq!(r, Err("No COMMAND_ACK from FC (timed out)".to_string()));
+        assert_eq!(sends, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn a_refusal_is_final_and_not_retried() {
+        let (r, sends) = run(Some(0), vec![ack(MavResult::MAV_RESULT_DENIED)]);
+        assert_eq!(r, Err("Command denied by the flight controller".to_string()));
+        assert_eq!(sends, vec![0]);
+    }
+
+    #[test]
+    fn in_progress_stops_resending_and_waits_for_the_result() {
+        let (r, sends) =
+            run(Some(0), vec![ack(MavResult::MAV_RESULT_IN_PROGRESS), ack(MavResult::MAV_RESULT_ACCEPTED)]);
+        assert_eq!(r, Ok(()));
+        assert_eq!(sends, vec![0]);
+    }
+
+    #[test]
+    fn in_progress_without_a_result_times_out_without_resending() {
+        let (r, sends) = run(Some(0), vec![ack(MavResult::MAV_RESULT_IN_PROGRESS)]);
+        assert_eq!(r, Err("No COMMAND_ACK from FC (timed out)".to_string()));
+        assert_eq!(sends, vec![0]);
+    }
+
+    #[test]
+    fn an_ack_for_another_command_is_ignored() {
+        let other = MavMessage::COMMAND_ACK(COMMAND_ACK_DATA {
+            command: MavCmd::MAV_CMD_COMPONENT_ARM_DISARM,
+            result: MavResult::MAV_RESULT_ACCEPTED,
+            ..Default::default()
+        });
+        let (r, sends) = run(Some(1), vec![other, ack(MavResult::MAV_RESULT_ACCEPTED)]);
+        assert_eq!(r, Ok(()));
+        assert_eq!(sends, vec![0, 1]);
     }
 }

@@ -81,6 +81,7 @@
   import { resolveModelKind, modelUri } from "$lib/helpers/uavModels";
   import { loadUavMesh, type UavMesh } from "$lib/helpers/uavMesh";
   import { renderUavTopDown, FIT as MODEL_FIT } from "$lib/helpers/uavTopDown";
+  import { FleetModelSprites } from "$lib/helpers/fleetModelSprites";
   import { toTelemetryData } from "$lib/adapters/telemetryAdapter";
   import { sunAltitudeDeg, cesiumLikeBrightness } from "$lib/utils/sun";
   import { ensureUserLocation, resolveUserLocation, userGeoLocation } from "$lib/helpers/userLocation";
@@ -541,7 +542,14 @@
   }
   /** How strongly the vehicle colour tints the model — enough to tell four identical quads apart. */
   const FLEET_MODEL_TINT = 0.55;
-  function drawFleetModel(marker: L.Marker, platformType: number, heading: number, pitch: number, roll: number, color: string) {
+  // One rasterised sprite per vehicle, rotated for heading — redrawing every model on every update
+  // pinned the UI thread with a 20-vehicle fleet (helpers/fleetModelSprites).
+  const fleetSprites = new FleetModelSprites(renderUavTopDown, (size) => {
+    const c = document.createElement('canvas');
+    c.width = size; c.height = size;
+    return c;
+  });
+  function drawFleetModel(id: string, marker: L.Marker, platformType: number, heading: number, pitch: number, roll: number, color: string) {
     const cv = marker.getElement()?.querySelector('canvas') as HTMLCanvasElement | null;
     const ctx = cv?.getContext('2d');
     if (!cv || !ctx) return;
@@ -551,7 +559,7 @@
       ctx.fillStyle = color; ctx.beginPath(); ctx.arc(cv.width / 2, cv.height / 2, 6, 0, 2 * Math.PI); ctx.fill();
       return;
     }
-    renderUavTopDown(ctx, mesh, cv.width, heading, pitch, roll, hexToRgb01(color), FLEET_MODEL_TINT);
+    fleetSprites.draw(id, cv, mesh, platformType, heading, pitch, roll, color, hexToRgb01(color), FLEET_MODEL_TINT, performance.now());
   }
   /** Per-marker icon signature — the DivIcon is only rebuilt when this changes (a `setIcon` replaces
    *  the canvas, so the model path avoids it on every frame and just redraws the canvas). */
@@ -769,7 +777,7 @@
           }));
           fleetIconKeys.set(v.vehicleId, key);
         }
-        if (modelStyle) drawFleetModel(marker, v.platformType, tv.yaw, tv.pitch, tv.roll, color);
+        if (modelStyle) drawFleetModel(v.vehicleId, marker, v.platformType, tv.yaw, tv.pitch, tv.roll, color);
         updateFleetTrail(v.vehicleId, tv, color, fleetLayer!);
         updateFleetHome(v, color, fleetLayer!);
         updateFleetMission(v, color, fleetLayer!);
@@ -817,7 +825,7 @@
       }
     });
     for (const [id, m] of fleetMarkers) {
-      if (!seen.has(id)) { fleetLayer.removeLayer(m); fleetMarkers.delete(id); fleetIconKeys.delete(id); }
+      if (!seen.has(id)) { fleetLayer.removeLayer(m); fleetMarkers.delete(id); fleetIconKeys.delete(id); fleetSprites.forget(id); }
     }
     if (viewMode === 'fleet') fitFleet(false); // keep every (selected) vehicle in view
     pruneFleetState(fleetLayer);

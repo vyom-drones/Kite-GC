@@ -96,6 +96,12 @@ fn build_v2_frame(
     frame
 }
 
+/// The one MAVLink system `msg` is addressed to, for transport routing (`ByteTransport::write_bytes_to`):
+/// `None` for broadcasts (target 0) and messages without a target.
+pub fn target_of(msg: &MavMessage) -> Option<u8> {
+    msg.target_system_id().filter(|t| *t != 0)
+}
+
 /// Build a GCS HEARTBEAT message
 pub fn gcs_heartbeat() -> MavMessage {
     MavMessage::HEARTBEAT(::mavlink::ardupilotmega::HEARTBEAT_DATA {

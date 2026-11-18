@@ -128,6 +128,14 @@ pub trait ByteTransport: Send {
     /// Write all bytes to the transport.
     fn write_bytes(&mut self, data: &[u8]) -> Result<(), TransportError>;
 
+    /// Write `data` addressed to MAVLink system `target` (`None` = every peer: broadcasts, the GCS
+    /// HEARTBEAT). Only a transport with several peers (UDP) uses the hint — it sends to the peer that
+    /// system speaks from instead of copying the frame to all of them. Default: `write_bytes`.
+    fn write_bytes_to(&mut self, target: Option<u8>, data: &[u8]) -> Result<(), TransportError> {
+        let _ = target;
+        self.write_bytes(data)
+    }
+
     /// Set the read timeout for later `read_bytes` calls, e.g. shortened by the MAVLink handler while
     /// streaming RC overrides. Default: no-op.
     fn set_read_timeout(&mut self, timeout: std::time::Duration) {

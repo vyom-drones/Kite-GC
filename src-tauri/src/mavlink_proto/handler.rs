@@ -64,11 +64,12 @@ pub enum MavlinkCommand {
     RegisterMissionReceiver { sysid: u8, tx: mpsc::Sender<MavMessage> },
     /// Unregister the mission receiver — telemetry dispatch resumes for all messages
     UnregisterMissionReceiver,
-    /// Register a channel to receive COMMAND_ACK during an active command operation
-    /// (mode switch / arm / takeoff / reposition / …). See `control.rs`.
+    /// Register a channel to receive `sysid`'s COMMAND_ACK during an active command operation
+    /// (mode switch / arm / takeoff / reposition / …). One slot per vehicle, so commands to several
+    /// vehicles on a shared link can be in flight at once (group commands). See `control.rs`.
     RegisterCommandReceiver { sysid: u8, tx: mpsc::Sender<MavMessage> },
-    /// Unregister the command-ack receiver
-    UnregisterCommandReceiver,
+    /// Unregister `sysid`'s command-ack receiver
+    UnregisterCommandReceiver { sysid: u8 },
     /// Register a channel to receive PARAM_VALUE during an active param read/write (see `params_rt.rs`)
     RegisterParamReceiver { sysid: u8, tx: mpsc::Sender<MavMessage> },
     /// Unregister the param receiver
@@ -76,6 +77,9 @@ pub enum MavlinkCommand {
     /// Re-emit `vehicle-discovered` for every vehicle this link currently knows (primary included) —
     /// the frontend asks after a page reload, when it has lost the announcements it saw live.
     AnnounceVehicles,
+    /// The app's active vehicle changed: `Some(sysid)` when it lives on this link, else `None`. The
+    /// handler moves the full stream profile to it and the fleet profile to the vehicle that had it.
+    SetActiveVehicle(Option<u8>),
     /// Send a hand-encoded message payload (fire-and-forget) — the handler frames it with its own
     /// sequence number and records/counts it like every TX. Used for TUNNEL (#385), which the typed
     /// crate cannot encode with INAV's payload type 0x8001 (see `tunnel.rs`).
@@ -134,6 +138,11 @@ impl MavlinkHandle {
     /// Ask the handler to re-emit `vehicle-discovered` for every vehicle it knows.
     pub fn announce_vehicles(&self) {
         let _ = self.cmd_tx.send(MavlinkCommand::AnnounceVehicles);
+    }
+
+    /// Tell the handler which of its vehicles is the app's active one (`None`: another link's).
+    pub fn set_active_vehicle(&self, sysid: Option<u8>) {
+        let _ = self.cmd_tx.send(MavlinkCommand::SetActiveVehicle(sysid));
     }
 
     /// Start reading the handshake vehicle's mode list (ArduPilot only — see `MavlinkCommand::StartModeList`).
@@ -322,17 +331,25 @@ fn shutdown_secondaries(vehicles: &mut std::collections::BTreeMap<u8, VehicleCtx
     }
 }
 
-/// Give a newly discovered vehicle the same treatment the connect path gave the handshake vehicle:
-/// stream shaping (or the full-telemetry reset) plus the one-shot EKF-type / home / Q_ENABLE requests.
-fn configure_new_vehicle(transport: &mut dyn ByteTransport, sysid: u8, fc_variant: &str, rates: &StreamRateConfig) {
+/// Stream profile of one vehicle: the configured profile (shaping, or the full-telemetry reset) for the
+/// app's active vehicle, the low-rate fleet profile for every other one (`streamrates::FLEET_*`).
+fn apply_rates(transport: &mut dyn ByteTransport, sysid: u8, fc_variant: &str, rates: &StreamRateConfig, active: bool) {
     let is_px4 = fc_variant == "PX4";
-    if rates.full_telemetry {
+    if !active {
+        super::streamrates::apply_fleet_stream_rates(transport, sysid, is_px4);
+    } else if rates.full_telemetry {
         super::streamrates::reset_stream_rates(transport, sysid, is_px4);
     } else {
         super::streamrates::apply_stream_rates(
             transport, sysid, rates.attitude_hz, rates.position_hz, rates.airspeed_enabled, rates.wind_enabled, is_px4,
         );
     }
+}
+
+/// Give a newly discovered vehicle the same treatment the connect path gave the handshake vehicle:
+/// its stream profile plus the one-shot EKF-type / home / Q_ENABLE requests.
+fn configure_new_vehicle(transport: &mut dyn ByteTransport, sysid: u8, fc_variant: &str, rates: &StreamRateConfig, active: bool) {
+    apply_rates(transport, sysid, fc_variant, rates, active);
     super::params::request_ekf_type(transport, sysid);
     super::params::request_home_position(transport, sysid);
     if fc_variant.starts_with("Ardu") {
@@ -419,9 +436,12 @@ fn handler_loop(
     // here instead of being dispatched as telemetry events.
     let mut mission_fwd: Option<(u8, mpsc::Sender<MavMessage>)> = None;
 
-    // Active command operation receiver — when set, that vehicle's COMMAND_ACK is forwarded here so
-    // the blocking command helper (control.rs) can match the ACK to the command it sent.
-    let mut cmd_fwd: Option<(u8, mpsc::Sender<MavMessage>)> = None;
+    // Active command operation receivers, per vehicle — a vehicle's COMMAND_ACK is forwarded to its
+    // entry so the blocking command helper (control.rs) can match the ACK to the command it sent.
+    let mut cmd_fwd: std::collections::HashMap<u8, mpsc::Sender<MavMessage>> = std::collections::HashMap::new();
+    // The app's active vehicle, if it is on this link: it streams the full profile, every other vehicle
+    // the fleet profile. The connect path gave the primary the full profile, so that is where it starts.
+    let mut active_sysid: Option<u8> = Some(fc_sysid);
     let mut param_fwd: Option<(u8, mpsc::Sender<MavMessage>)> = None;
     // MSP-over-MAVLink tunnel receiver (INAV 10.0+): payloads of TUNNEL frames addressed to Kite.
     let mut tunnel_fwd: Option<mpsc::Sender<Vec<u8>>> = None;
@@ -468,7 +488,7 @@ fn handler_loop(
                     if let Ok(mut r) = rec.lock() { r.write_raw_mavlink_frame(&frame); }
                 }
                 let result = transport
-                    .write_bytes(&frame)
+                    .write_bytes_to(codec::target_of(&msg), &frame)
                     .map_err(|e| format!("MAVLink send failed: {}", e));
                 let _ = reply.send(result);
                 continue;
@@ -485,12 +505,12 @@ fn handler_loop(
             }
             Ok(MavlinkCommand::RegisterCommandReceiver { sysid, tx }) => {
                 log::debug!("MAVLink command receiver registered (sysid={})", sysid);
-                cmd_fwd = Some((sysid, tx));
+                cmd_fwd.insert(sysid, tx);
                 continue;
             }
-            Ok(MavlinkCommand::UnregisterCommandReceiver) => {
-                log::debug!("MAVLink command receiver unregistered");
-                cmd_fwd = None;
+            Ok(MavlinkCommand::UnregisterCommandReceiver { sysid }) => {
+                log::debug!("MAVLink command receiver unregistered (sysid={})", sysid);
+                cmd_fwd.remove(&sysid);
                 continue;
             }
             Ok(MavlinkCommand::RegisterParamReceiver { sysid, tx }) => {
@@ -501,6 +521,17 @@ fn handler_loop(
             Ok(MavlinkCommand::UnregisterParamReceiver) => {
                 log::debug!("MAVLink param receiver unregistered");
                 param_fwd = None;
+                continue;
+            }
+            Ok(MavlinkCommand::SetActiveVehicle(new)) => {
+                if new != active_sysid {
+                    let old = std::mem::replace(&mut active_sysid, new);
+                    for (sysid, active) in [(old, false), (new, true)] {
+                        let Some((&sysid, ctx)) = sysid.and_then(|s| vehicles.get_key_value(&s)) else { continue };
+                        apply_rates(&mut *transport, sysid, &ctx.fc_variant, &rates, active);
+                    }
+                    log::info!("MAVLink rates on L{}: full profile → {:?} (was {:?})", app_handle.link_id(), new, old);
+                }
                 continue;
             }
             Ok(MavlinkCommand::AnnounceVehicles) => {
@@ -677,7 +708,7 @@ fn handler_loop(
             if let Some(ref rec) = recorder {
                 if let Ok(mut r) = rec.lock() { r.write_raw_mavlink_frame(&frame); }
             }
-            if let Err(e) = transport.write_bytes(&frame) {
+            if let Err(e) = transport.write_bytes_to(Some(*sysid), &frame) {
                 log::warn!("Failed to request AUTOPILOT_VERSION from sysid={}: {}", sysid, e);
             }
         }
@@ -775,7 +806,7 @@ fn handler_loop(
                         if ctx.fc_variant.starts_with("Ardu") {
                             ctx.modes = Some(super::modes::ModeEnumerator::new(sysid, Instant::now()));
                         }
-                        configure_new_vehicle(&mut *transport, sysid, &ctx.fc_variant, &rates);
+                        configure_new_vehicle(&mut *transport, sysid, &ctx.fc_variant, &rates, active_sysid == Some(sysid));
                         let _ = ctx.emitter.emit("vehicle-discovered", ctx.info(sysid, false));
                         vehicles.insert(sysid, ctx);
                     }
@@ -834,13 +865,11 @@ fn handler_loop(
                     // to the command it sent (mode/arm/takeoff/reposition/…). Otherwise it falls
                     // through to dispatch (which logs it at trace level).
                     if matches!(frame.message, MavMessage::COMMAND_ACK(_)) {
-                        if let Some((target, ref tx)) = cmd_fwd {
-                            if target == sysid {
-                                if tx.send(frame.message).is_err() {
-                                    cmd_fwd = None;
-                                }
-                                continue;
+                        if let Some(tx) = cmd_fwd.get(&sysid) {
+                            if tx.send(frame.message).is_err() {
+                                cmd_fwd.remove(&sysid);
                             }
+                            continue;
                         }
                     }
 
@@ -1023,7 +1052,7 @@ fn send_mav_frame(
     if let Some(ref rec) = recorder {
         if let Ok(mut r) = rec.lock() { r.write_raw_mavlink_frame(&frame); }
     }
-    if let Err(e) = transport.write_bytes(&frame) {
+    if let Err(e) = transport.write_bytes_to(codec::target_of(msg), &frame) {
         log::warn!("Failed to send MAVLink frame (msg_id {}): {}", msg.message_id(), e);
     }
 }

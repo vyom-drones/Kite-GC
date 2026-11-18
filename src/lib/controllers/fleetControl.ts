@@ -5,9 +5,9 @@
 // logic only (no UI); the bar/dialog decide WHAT to send and to WHOM, this module decides HOW.
 //
 // Dispatch rules (docs/02-design/features/fleet-control.design.md §3):
-//  • The MAVLink link handler holds a single COMMAND_ACK forward slot per link, so two in-flight
-//    commands to two vehicles on the SAME link would clobber each other's ACK. Targets are therefore
-//    grouped by link: strictly sequential inside a link, links in parallel.
+//  • The MAVLink link handler forwards COMMAND_ACKs per vehicle (one slot per sysid), so commands go
+//    to every target at once. Mission uploads use the single mission slot of a link and stay
+//    sequential inside a link, links in parallel.
 //  • Takeoff is fully serial across all links with a stagger delay between vehicles, so a formation
 //    never leaves the ground at the same instant.
 //  • Every backend call names its `vehicleId` explicitly — the active vehicle is irrelevant here.
@@ -216,7 +216,8 @@ export async function runGroupCommand(
       if (i > 0 && stagger > 0) await sleep(stagger);
       await runItem(runId, kind, targets[i].vehicle, params, i);
     }
-  } else {
+  } else if (kind === 'missionUpload') {
+    // Mission protocol: one transfer per link at a time (the handler has one mission slot per link).
     const byLink = new Map<number, { v: VehicleSummary; pos: number }[]>();
     targets.forEach((t, pos) => {
       const list = byLink.get(t.vehicle.linkId) ?? [];
@@ -228,6 +229,10 @@ export async function runGroupCommand(
         for (const { v, pos } of queue) await runItem(runId, kind, v, params, pos);
       }),
     );
+  } else {
+    // COMMAND_ACKs are matched per vehicle (one slot per sysid), so every target goes out at once — an
+    // RTL to a fleet no longer waits for each aircraft's round trip in turn.
+    await Promise.all(targets.map((t, pos) => runItem(runId, kind, t.vehicle, params, pos)));
   }
 
   groupRun.update((r) => (r && r.id === runId ? { ...r, finishedAt: Date.now() } : r));

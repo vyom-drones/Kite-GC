@@ -5,6 +5,7 @@
 //! `"L{link}:S{sysid}"` (sysid 0 for non-MAVLink). One vehicle is ACTIVE — the target of every untargeted
 //! command and singleton consumer; telemetry events carry their vehicle id ([`emitter::VehicleEmitter`]).
 
+pub mod coalesce;
 pub mod emitter;
 
 use std::collections::BTreeMap;
@@ -141,6 +142,19 @@ impl LinkRegistry {
         Self { links: BTreeMap::new(), active: None, next_id: 1 }
     }
 
+    /// The one place the active selection changes, so the fleet-telemetry coalescer always knows which
+    /// vehicle still emits per frame, and every MAVLink link streams the full profile from its active
+    /// vehicle only (the others drop to the fleet profile).
+    fn set_active_inner(&mut self, v: Option<VehicleId>) {
+        coalesce::set_active(v.as_ref().map(VehicleId::to_key));
+        for entry in self.links.values() {
+            if let ActiveProtocol::Mavlink(h) = &entry.protocol {
+                h.set_active_vehicle(v.as_ref().filter(|a| a.link == entry.id).map(|a| a.sysid));
+            }
+        }
+        self.active = v;
+    }
+
     /// Reserve a link id for a connect that is about to run. Handler-side state (emitters) needs the
     /// id before the handshake completes, and two overlapping connects must never share one.
     pub fn reserve_id(&mut self) -> LinkId {
@@ -153,13 +167,12 @@ impl LinkRegistry {
     /// becomes the active vehicle. Returns whether the active selection changed.
     pub fn insert(&mut self, entry: LinkEntry) -> bool {
         debug_assert_eq!(entry.id, entry.primary.link, "primary vehicle must live on its own link");
-        let activated = if self.active.is_none() {
-            self.active = Some(entry.primary.clone());
-            true
-        } else {
-            false
-        };
+        let activated = self.active.is_none();
+        let primary = entry.primary.clone();
         self.links.insert(entry.id, entry);
+        if activated {
+            self.set_active_inner(Some(primary));
+        }
         activated
     }
 
@@ -169,7 +182,8 @@ impl LinkRegistry {
         let entry = self.links.remove(&id)?;
         let active_changed = match &self.active {
             Some(a) if a.link == id => {
-                self.active = self.links.values().next().map(|e| e.primary.clone());
+                let next = self.links.values().next().map(|e| e.primary.clone());
+                self.set_active_inner(next);
                 Some(self.active.clone())
             }
             _ => None,
@@ -179,7 +193,7 @@ impl LinkRegistry {
 
     /// Drain every link (disconnect-all). Clears the active selection.
     pub fn drain(&mut self) -> Vec<LinkEntry> {
-        self.active = None;
+        self.set_active_inner(None);
         std::mem::take(&mut self.links).into_values().collect()
     }
 
@@ -218,7 +232,7 @@ impl LinkRegistry {
         if !crate::fleet_mode::allows(v == entry.primary, crate::fleet_mode::enabled()) {
             return Err(ERR_FLEET_OFF.into());
         }
-        self.active = Some(v);
+        self.set_active_inner(Some(v));
         Ok(())
     }
 
