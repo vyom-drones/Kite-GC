@@ -1381,6 +1381,12 @@ fn dispatch_message(header: &MavHeader, message: &MavMessage, fc_variant: &str, 
             }
         }
 
+        // ── CAMERA_FOV_STATUS → telemetry-camera-fov ────────────────
+        // Where the gimbal looks (gimbal target on the map) — ArduPilot's camera backend, any mount.
+        MavMessage::CAMERA_FOV_STATUS(fov) => {
+            let _ = app_handle.emit("telemetry-camera-fov", &super::camera_fov::parse_camera_fov(fov));
+        }
+
         // ── HOME_POSITION → home-position ───────────────────────────
         // Authoritative FC home from the aircraft's memory (pushed at ~0.2 Hz + on home change), so
         // the map shows a consistent home instead of guessing from the GPS fix at arm.

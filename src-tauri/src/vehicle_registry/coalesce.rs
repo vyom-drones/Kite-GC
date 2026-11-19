@@ -35,6 +35,7 @@ const COALESCED: &[&str] = &[
     "telemetry-analog",
     "telemetry-attitude",
     "telemetry-batteries",
+    "telemetry-camera-fov",
     "telemetry-ekf-status",
     "telemetry-fc-link",
     "telemetry-flightmode",

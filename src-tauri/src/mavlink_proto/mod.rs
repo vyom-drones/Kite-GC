@@ -5,6 +5,7 @@
 // Handles MAVLink v1/v2 frame parsing, serialization, handshake, and handler thread.
 // Uses the `mavlink` crate for message definitions (ardupilotmega dialect).
 
+pub mod camera_fov;
 pub mod codec;
 pub mod control;
 pub mod handler;

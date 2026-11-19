@@ -5,6 +5,7 @@
 // Holds real-time telemetry data received from the flight controller.
 // Listens to Tauri events emitted by the MSP scheduler thread.
 
+import type { CameraFov } from '$lib/helpers/gimbalTarget';
 import { writable, get } from 'svelte/store';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
@@ -188,6 +189,10 @@ export const telemetry = writable<TelemetryData>({ ...defaultTelemetry });
 // changes on every frame of every vehicle and the fleet layer doesn't need more than that.
 const perVehicle = new Map<string, TelemetryData>();
 export const allTelemetry = writable<ReadonlyMap<string, TelemetryData>>(new Map());
+
+/** Each vehicle's latest camera / gimbal status (CAMERA_FOV_STATUS) with its arrival time — the gimbal target
+ *  on the map (stores/gimbalTarget). Only vehicles with a camera on a mount report it. */
+export const cameraFovs = writable<ReadonlyMap<string, CameraFov & { ts: number }>>(new Map());
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 function scheduleFlush(): void {
   if (flushTimer) return;
@@ -679,6 +684,14 @@ async function startTelemetryListenersInner() {
         gpsHdop: event.payload.hdop > 0 ? event.payload.hdop : t.gpsHdop,
         lastUpdate: Date.now(),
       }));
+    })
+  );
+
+  fresh.push(
+    await listenLive<CameraFov & { vehicleId?: string }>('telemetry-camera-fov', (event) => {
+      const { vehicleId, ...fov } = event.payload;
+      if (!vehicleId) return;
+      cameraFovs.update((m) => new Map(m).set(vehicleId, { ...fov, ts: Date.now() }));
     })
   );
 

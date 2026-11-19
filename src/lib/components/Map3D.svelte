@@ -52,6 +52,9 @@
   import { orderedVehicles, vehicleColorFor } from "$lib/helpers/fleetStatus";
   import MapVideoPopup from "$lib/components/video/MapVideoPopup.svelte";
   import { vehicleStreams } from "$lib/stores/fleetVideo";
+  import { gimbalTargets } from "$lib/stores/gimbalTarget";
+  import { formatLatLon, gimbalTipLines, type GimbalTarget } from "$lib/helpers/gimbalTarget";
+  import { copyToClipboard } from "$lib/helpers/clipboard";
   import { connection, type ConnectionStatus } from "$lib/stores/connection";
   import { settings } from "$lib/stores/settings";
   import { gcsLocation } from "$lib/stores/gcsLocation";
@@ -1476,6 +1479,9 @@
       // Fleet (other connected vehicles) first: a click makes that vehicle the active one.
       const vid = fleet3dPickId(e.position);
       if (vid != null) { fleetVideoHover = null; void switchVehicle(vid); return; }
+      // A gimbal target ring copies its position — before Fly Here, which would take the ground under it.
+      const gid = gimbal3dPickId(e.position);
+      if (gid != null) { void copyGimbal3dTarget(gid); return; }
       const id = radarPickId(e.position);
       if (id != null) { radarSelection.update((cur) => (cur === id ? null : id)); return; }
       // The own aircraft: the terrain behind it along the ray is not what the tap meant. Looked for
@@ -1491,10 +1497,14 @@
     }, Cesium.ScreenSpaceEventType.LEFT_CLICK, Cesium.KeyboardEventModifier.CTRL);
     radar3dPickHandler.setInputAction((e: Cesium.ScreenSpaceEventHandler.MotionEvent) => {
       const vid = fleet3dPickId(e.endPosition);
-      if (viewer) viewer.canvas.style.cursor = (vid != null || radarPickId(e.endPosition) != null) ? 'pointer' : '';
+      const gid = vid == null ? gimbal3dPickId(e.endPosition) : null;
+      if (viewer) viewer.canvas.style.cursor = (vid != null || gid != null || radarPickId(e.endPosition) != null) ? 'pointer' : '';
       updateFleetVideoHover(vid, e.endPosition);
+      if (gid !== gimbalHover?.id) gimbalCopied = false;
+      gimbalHover = gid != null ? { id: gid, name: fleet3dKnown.get(gid)?.name ?? gid, x: e.endPosition.x, y: e.endPosition.y } : null;
     }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
     updateFleet3D();
+    updateGimbal3D(gimbal3dTargets);
 
     // Foreign-vehicle contacts: rebuild the 3D radar entities on snapshot / selection change.
     unsubRadar3d = radarVehicles.subscribe((s) => { radar3dSnap = s; updateRadar3D(); });
@@ -2132,6 +2142,70 @@
     }
     vw.scene.requestRender();
   }
+  // Gimbal targets (stores/gimbalTarget): where each vehicle's camera looks — a ring in the vehicle's colour at the
+  // target (visible through terrain) and a dashed line of sight from the camera; heights MSL + geoidOffset.
+  let gimbal3dTargets = $state.raw<ReadonlyMap<string, GimbalTarget>>(new Map());
+  const gimbal3d = new Map<string, { point: Cesium.Entity; line: Cesium.Entity }>();
+  // Hover popup over a target ring (same text as the 2D tooltip); a click copies its "lat, lon".
+  let gimbalHover = $state<{ id: string; name: string; x: number; y: number } | null>(null);
+  let gimbalCopied = $state(false);
+  let gimbalCopiedTimer: ReturnType<typeof setTimeout> | undefined;
+  const GIMBAL_COPIED_MS = 1500;
+  function gimbal3dPickId(windowPos: Cesium.Cartesian2): string | null {
+    const ent = viewer?.scene.pick(windowPos)?.id;
+    if (!(ent instanceof Cesium.Entity)) return null;
+    for (const [id, e] of gimbal3d) if (e.point === ent) return id;
+    return null;
+  }
+  async function copyGimbal3dTarget(id: string) {
+    const g = gimbal3dTargets.get(id);
+    if (!g || !(await copyToClipboard(formatLatLon(g.lat, g.lon)))) return;
+    gimbalCopied = true;
+    clearTimeout(gimbalCopiedTimer);
+    gimbalCopiedTimer = setTimeout(() => (gimbalCopied = false), GIMBAL_COPIED_MS);
+  }
+  function updateGimbal3D(targets: ReadonlyMap<string, GimbalTarget>) {
+    const vw = viewer;
+    if (!vw) return;
+    const ordered = orderedVehicles(fleet3dKnown);
+    for (const [id, g] of targets) {
+      const color = Cesium.Color.fromCssColorString(vehicleColorFor(ordered, id));
+      const target = Cesium.Cartesian3.fromDegrees(g.lon, g.lat, Math.max((g.altMsl ?? 0) + geoidOffset, 0));
+      const cam = Cesium.Cartesian3.fromDegrees(g.camLon, g.camLat, Math.max((g.camAltMsl ?? g.altMsl ?? 0) + geoidOffset, 0));
+      const e = gimbal3d.get(id);
+      if (!e) {
+        gimbal3d.set(id, {
+          point: vw.entities.add({
+            position: target,
+            point: {
+              pixelSize: 12, color: Cesium.Color.TRANSPARENT, outlineColor: color, outlineWidth: 3,
+              disableDepthTestDistance: Number.POSITIVE_INFINITY,
+            },
+          }),
+          line: vw.entities.add({
+            // depthFailMaterial: the end at the estimated ground can sit just under the 3D terrain — keep it drawn.
+            polyline: {
+              positions: [cam, target], width: 2,
+              material: new Cesium.PolylineDashMaterialProperty({ color, dashLength: 12 }),
+              depthFailMaterial: new Cesium.PolylineDashMaterialProperty({ color: color.withAlpha(0.5), dashLength: 12 }),
+            },
+          }),
+        });
+        continue;
+      }
+      e.point.position = new Cesium.ConstantPositionProperty(target);
+      if (e.point.point) e.point.point.outlineColor = new Cesium.ConstantProperty(color);
+      if (e.line.polyline) e.line.polyline.positions = new Cesium.ConstantProperty([cam, target]);
+    }
+    for (const [id, e] of gimbal3d) {
+      if (targets.has(id)) continue;
+      vw.entities.remove(e.point);
+      vw.entities.remove(e.line);
+      gimbal3d.delete(id);
+    }
+    vw.scene.requestRender();
+  }
+
   /** A new session after a disconnect-all: the previous fleet's picture goes. */
   function clearFleet3D() {
     for (const rec of fleet3d.values()) { fleet3dRemove(rec, ['model', 'trail', 'home', 'target', 'line', 'ring']); for (const e of rec.mission ?? []) viewer?.entities.remove(e); }
@@ -2159,6 +2233,7 @@
     }),
     guidedTargets.subscribe((v) => { fleet3dTargets = v; if (viewer) updateFleet3D(); }),
     vehicleHomes.subscribe((v) => { fleet3dHomes = v; if (viewer) updateFleet3D(); }),
+    gimbalTargets.subscribe((v) => { gimbal3dTargets = v; if (viewer) updateGimbal3D(v); }),
     arduMissionsByVehicle.subscribe((v) => { fleet3dMissions = v; if (viewer) updateFleet3D(); }),
     guidedActive.subscribe(() => { if (viewer) updateFleet3D(); }),
   ];
@@ -5428,6 +5503,17 @@
     </div>
   {/if}
 
+  {#if gimbalHover}
+    {@const g = gimbal3dTargets.get(gimbalHover.id)}
+    {#if g}
+      <div class="gimbal-hover" style:left="{gimbalHover.x + 14}px" style:top="{gimbalHover.y + 14}px">
+        {#each gimbalTipLines($t, gimbalHover.name, g, gimbalCopied) as line}
+          <div>{line}</div>
+        {/each}
+      </div>
+    {/if}
+  {/if}
+
   {#if cameraMode === 'fpv'}
     {@const sp = convertSpeed(hud.speedMs, hudSpeedUnit)}
     {@const al = convertAltitude(hud.altM, hudAltUnit)}
@@ -5534,6 +5620,10 @@
 
 <style>
   .fleet-video-hover { position: absolute; z-index: 5; pointer-events: none; }
+  .gimbal-hover {
+    position: absolute; z-index: 5; pointer-events: none; padding: 4px 8px; border-radius: 4px;
+    background: rgba(20, 22, 26, 0.92); color: #fff; font-size: 12px; line-height: 1.4; white-space: nowrap;
+  }
   .map3d-wrapper {
     width: 100%;
     height: 100%;

@@ -84,6 +84,9 @@
   import { FleetModelSprites } from "$lib/helpers/fleetModelSprites";
   import MapVideoPopup from "$lib/components/video/MapVideoPopup.svelte";
   import { vehicleStreams } from "$lib/stores/fleetVideo";
+  import { gimbalTargets } from "$lib/stores/gimbalTarget";
+  import { formatLatLon, gimbalTipLines, type GimbalTarget } from "$lib/helpers/gimbalTarget";
+  import { copyToClipboard } from "$lib/helpers/clipboard";
   import { toTelemetryData } from "$lib/adapters/telemetryAdapter";
   import { sunAltitudeDeg, cesiumLikeBrightness } from "$lib/utils/sun";
   import { ensureUserLocation, resolveUserLocation, userGeoLocation } from "$lib/helpers/userLocation";
@@ -551,6 +554,69 @@
     c.width = size; c.height = size;
     return c;
   });
+  // Gimbal targets (stores/gimbalTarget): where each vehicle's camera looks — a crosshair in the vehicle's
+  // colour (dashed when only estimated) and a dashed line of sight from the camera.
+  let gimbalLayer: L.LayerGroup | undefined;
+  const gimbalDrawn = new Map<string, { marker: L.Marker; line: L.Polyline; key: string; target: GimbalTarget; copiedUntil: number }>();
+  const GIMBAL_COPIED_MS = 1500;
+  function gimbalIconHtml(color: string, estimate: boolean): string {
+    const dash = estimate ? ' stroke-dasharray="3 2"' : '';
+    return `<svg viewBox="0 0 24 24" width="24" height="24"><circle cx="12" cy="12" r="7" fill="none" stroke="${color}" stroke-width="2"${dash}/>`
+      + `<path d="M12 1v6M12 17v6M1 12h6M17 12h6" stroke="${color}" stroke-width="2"/><circle cx="12" cy="12" r="1.6" fill="${color}"/></svg>`;
+  }
+  /** The tooltip as text nodes (a vehicle name is never parsed as HTML). */
+  function gimbalTip(id: string, g: GimbalTarget): HTMLElement {
+    const copied = Date.now() < (gimbalDrawn.get(id)?.copiedUntil ?? 0);
+    const el = document.createElement('div');
+    for (const line of gimbalTipLines(get(t), fleetKnown.get(id)?.name ?? id, g, copied)) {
+      const row = document.createElement('div');
+      row.textContent = line;
+      el.appendChild(row);
+    }
+    return el;
+  }
+  async function copyGimbalTarget(id: string) {
+    const d = gimbalDrawn.get(id);
+    if (!d || !(await copyToClipboard(formatLatLon(d.target.lat, d.target.lon)))) return;
+    d.copiedUntil = Date.now() + GIMBAL_COPIED_MS;
+    d.marker.setTooltipContent(gimbalTip(id, d.target));
+  }
+  function updateGimbalTargets(targets: ReadonlyMap<string, GimbalTarget>) {
+    if (!map) return;
+    gimbalLayer ??= L.layerGroup().addTo(map);
+    for (const [id, g] of targets) {
+      const color = fleetColors.get(id) ?? '#37a8db';
+      const key = `${color}|${g.source}`;
+      const los: L.LatLngExpression[] = [[g.camLat, g.camLon], [g.lat, g.lon]];
+      let d = gimbalDrawn.get(id);
+      if (!d) {
+        const marker = L.marker([g.lat, g.lon], { zIndexOffset: 850, interactive: true });
+        const line = L.polyline(los, { color, weight: 1.5, dashArray: '4 6', opacity: 0.85, interactive: false });
+        marker.bindTooltip('', { direction: 'top', offset: [0, -12], opacity: 0.95 });
+        marker.on('click', () => void copyGimbalTarget(id));
+        line.addTo(gimbalLayer);
+        marker.addTo(gimbalLayer);
+        d = { marker, line, key: '', target: g, copiedUntil: 0 };
+        gimbalDrawn.set(id, d);
+      }
+      d.target = g;
+      if (d.key !== key) {
+        d.marker.setIcon(L.divIcon({ className: 'gimbal-target', html: gimbalIconHtml(color, g.source === 'estimate'), iconSize: [24, 24], iconAnchor: [12, 12] }));
+        d.line.setStyle({ color });
+        d.key = key;
+      }
+      d.marker.setLatLng([g.lat, g.lon]);
+      d.marker.setTooltipContent(gimbalTip(id, g));
+      d.line.setLatLngs(los);
+    }
+    for (const [id, d] of gimbalDrawn) {
+      if (targets.has(id)) continue;
+      gimbalLayer.removeLayer(d.marker);
+      gimbalLayer.removeLayer(d.line);
+      gimbalDrawn.delete(id);
+    }
+  }
+
   // Fleet video on hover (MapVideoPopup): a drone's live preview above its marker while the pointer is on it.
   // One at a time; its lease starts the preview stream and closing ends it (after the idle delay).
   let fleetVideoPopup: { id: string; popup: L.Popup; comp: ReturnType<typeof mount> } | null = null;
@@ -879,6 +945,7 @@
       if (map) updateFleet();
     }),
     allTelemetry.subscribe((v) => { fleetTelem = v; if (map) updateFleet(); }),
+    gimbalTargets.subscribe((v) => { if (map) updateGimbalTargets(v); }),
     vehicles.subscribe((v) => {
       const wasEmpty = fleetKnown.size === 0;
       fleetKnown = v;
@@ -3383,6 +3450,8 @@
     box-shadow: 0 2px 10px rgba(0, 0, 0, 0.5);
   }
   :global(.guided-popup-wrap .leaflet-popup-tip) { background: rgba(46, 46, 46, 0.97); }
+
+  :global(.gimbal-target) { background: none; border: none; filter: drop-shadow(0 0 2px rgba(0, 0, 0, 0.8)); }
 
   /* Fleet video hover popup: just the tile (MapVideoPopup) — no Leaflet frame, never in the pointer's way. */
   :global(.fleet-video-popup) { pointer-events: none; }
