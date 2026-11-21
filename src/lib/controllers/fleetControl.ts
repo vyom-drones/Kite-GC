@@ -9,7 +9,9 @@
 //    to every target at once. Mission uploads use the single mission slot of a link and stay
 //    sequential inside a link, links in parallel.
 //  • Takeoff is fully serial across all links with a stagger delay between vehicles, so a formation
-//    never leaves the ground at the same instant.
+//    never leaves the ground at the same instant. Each vehicle is then watched for a few seconds (in
+//    parallel with the next takeoffs): one that disarms itself right away (auto-disarm) gets one more
+//    arm + takeoff, and fails the run item if it disarms again.
 //  • Every backend call names its `vehicleId` explicitly — the active vehicle is irrelevant here.
 //  • Nothing throws: the backend's error string (denied / unsupported / ACK timeout …) is recorded on
 //    the item and the run continues with the next vehicle.
@@ -27,6 +29,7 @@ import {
   orderedVehicles, vehicleColorFor, vehicleSystem, vehicleClassOf, isFixedWingClass, isMavlinkVehicle,
   isVehicleArmed, resolveIntentMode, vehicleActiveMode,
 } from '$lib/helpers/fleetStatus';
+import { takeoffWatchVerdict } from '$lib/helpers/takeoffWatch';
 
 export type { GroupCommandKind, FleetModeIntent };
 
@@ -180,6 +183,33 @@ async function sendOne(kind: GroupCommandKind, v: VehicleSummary, p: GroupComman
   }
 }
 
+/** Watch `id` after its takeoff: true when it stayed armed, false when it disarmed (helpers/takeoffWatch). */
+async function staysArmedAfterTakeoff(id: string): Promise<boolean> {
+  const start = Date.now();
+  let sawArmed = false;
+  for (;;) {
+    const tv = get(allTelemetry).get(id);
+    const armed = !!tv && isVehicleArmed(tv);
+    sawArmed ||= armed;
+    const verdict = takeoffWatchVerdict(armed, sawArmed, Date.now() - start);
+    if (verdict !== 'watching') return verdict === 'stayedArmed';
+    await sleep(200);
+  }
+}
+
+/** After a sent takeoff: ok when the vehicle stays armed; one more arm + takeoff when it disarmed itself. */
+async function confirmTakeoff(runId: number, v: VehicleSummary, p: GroupCommandParams): Promise<void> {
+  try {
+    if (!(await staysArmedAfterTakeoff(v.vehicleId))) {
+      await sendOne('takeoff', v, p, 0);
+      if (!(await staysArmedAfterTakeoff(v.vehicleId))) throw new Error('Disarmed right after takeoff');
+    }
+    patchItem(runId, v.vehicleId, { status: 'ok' });
+  } catch (e) {
+    patchItem(runId, v.vehicleId, { status: 'fail', message: e instanceof Error ? e.message : String(e) });
+  }
+}
+
 async function runItem(runId: number, kind: GroupCommandKind, v: VehicleSummary, p: GroupCommandParams, pos: number): Promise<void> {
   patchItem(runId, v.vehicleId, { status: 'running', message: '' });
   try {
@@ -216,10 +246,20 @@ export async function runGroupCommand(
   if (kind === 'takeoff') {
     // Fully serial + stagger, regardless of link.
     const stagger = Math.max(0, params.staggerMs ?? 1000);
+    const confirms: Promise<void>[] = [];
     for (let i = 0; i < targets.length; i++) {
       if (i > 0 && stagger > 0) await sleep(stagger);
-      await runItem(runId, kind, targets[i].vehicle, params, i);
+      const v = targets[i].vehicle;
+      patchItem(runId, v.vehicleId, { status: 'running', message: '' });
+      try {
+        await sendOne(kind, v, params, i);
+      } catch (e) {
+        patchItem(runId, v.vehicleId, { status: 'fail', message: e instanceof Error ? e.message : String(e) });
+        continue;
+      }
+      confirms.push(confirmTakeoff(runId, v, params));
     }
+    await Promise.all(confirms);
   } else if (kind === 'missionUpload') {
     // Mission protocol: one transfer per link at a time (the handler has one mission slot per link).
     const byLink = new Map<number, { v: VehicleSummary; pos: number }[]>();
