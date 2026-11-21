@@ -63,6 +63,17 @@ class FleetVideoServerTest(unittest.TestCase):
     def test_pipeline_ends_in_the_payloader_the_server_needs(self):
         self.assertIn('rtph264pay name=pay0', launch_string(1, 'main'))
 
+    def test_h265_option_switches_both_h26x_streams(self):
+        for stream in ('main', 'preview'):
+            line = launch_string(2, stream, codec='h265')
+            self.assertIn('x265enc', line)
+            self.assertIn('rtph265pay name=pay0 pt=96 config-interval=1', line)
+            self.assertNotIn('x264enc', line)
+        self.assertIn('bitrate=800', launch_string(2, 'main', main_kbps=800, codec='h265'))
+        self.assertIn('jpegenc', launch_string(2, 'preview', preview_codec='mjpeg', codec='h265'), 'MJPEG preview wins')
+        with self.assertRaises(ValueError):
+            launch_string(2, 'main', codec='vp9')
+
 
 if __name__ == '__main__':
     unittest.main()
